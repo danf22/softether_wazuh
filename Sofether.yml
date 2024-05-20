@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Softether on Amazon EC2
+
+Parameters:
+  LatestAmiId :
+    Type : 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
+  NameBurtualHubVPN:
+    Type: String
+    Description: HUB Name Softether VPN.
+  EC2InstanceType:
+    Type: String
+    Description: EC2 instance type for the Softether VPN.
+    Default: t3a.medium
+  IPsecPreSharedKey:
+    Type: String
+    NoEcho: true
+    Description: Ipsec Pre-shared Key.
+  SubnetIdPublicSoftether:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet where the Softether will be deployed need to be Public.
+  SubnetIdPrivateWazuh:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet where the Wazuh will be deployed need to be Private.
+  SoftetherPassword:
+    Description: "Password for Softether. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
+  WazuhPassword:
+    Description: "Password for Wazuh. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
+    
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the EC2 instance will be deployed
+
+Resources:
+  SoftetherInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: SoftetherRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SoftetherPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "ssm:*"
+                  - "ssmmessages:*"
+                  - "ec2messages:*"
+                  - 'cloudformation:*'
+                Resource: "*"
+  SoftetherInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: SoftetherInstanceProfile
+      Roles:
+        - !Ref SoftetherInstanceRole
+
+  SoftetherNetworkInterface1:
+    Type: "AWS::EC2::NetworkInterface"
+    Properties:
+      Description: "Additional Network Interface 1"
+      GroupSet:
+        - !Ref SecurityGroup # Security Group ID
+      SubnetId: !Ref SubnetIdPublicSoftether # Subnet ID
+      Tags:
+        - Key: Name
+          Value: "Softether"
+  SoftetherInstance:
+    Type: 'AWS::EC2::Instance'
+    DependsOn: 
+      - SoftetherNetworkInterface1
+      - WazuhInstance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref SoftetherInstanceProfile
+      NetworkInterfaces:
+        - 
+          DeviceIndex: 1
+          GroupSet:
+            - !Ref SecurityGroup # Security Group ID
+          SubnetId: !Ref SubnetIdPublicSoftether # Subnet ID of the primary interface
+        - 
+          DeviceIndex: 0
+          NetworkInterfaceId: !Ref SoftetherNetworkInterface1
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo su
+          sudo yum update -y
+          yum -y install epel-release
+          yum -y groupinstall "Development Tools"
+          # softether version 4.43
+          cd /usr/local/
+          wget https://www.softether-download.com/files/softether/v4.43-9799-beta-2023.08.31-tree/Linux/SoftEther_VPN_Server/64bit_-_Intel_x64_or_AMD64/softether-vpnserver-v4.43-9799-beta-2023.08.31-linux-x64-64bit.tar.gz
+          tar xvf softether-vpnserver-*
+          rm -rf softether-vpnserver-*
+          cd vpnserver && make
+          cat << 'EOF' > /etc/init.d/vpnserver
+          #!/bin/sh
+          # chkconfig: 2345 99 01
+          # description: SoftEther VPN Server
+          DAEMON=/usr/local/vpnserver/vpnserver
+          LOCK=/var/lock/subsys/vpnserver
+          test -x $DAEMON || exit 0
+          case "$1" in
+          start)
+          $DAEMON start
+          touch $LOCK
+          ;;
+          stop)
+          $DAEMON stop
+          rm $LOCK
+          ;;
+          restart)
+          $DAEMON stop
+          sleep 3
+          $DAEMON start
+          ;;
+          *)
+          echo "Usage: $0 {start|stop|restart}"
+          exit 1
+          esac
+          exit 0
+          EOF
+          chmod 755 /etc/init.d/vpnserver
+          /etc/init.d/vpnserver start
+          chkconfig --add vpnserver 
+          rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
+          cat << 'EOF' > /etc/yum.repos.d/wazuh.repo
+          [wazuh]
+          gpgcheck=1
+          gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
+          enabled=1
+          name=EL-\$releasever - Wazuh
+          baseurl=https://packages.wazuh.com/4.x/yum/
+          protect=1
+          EOF
+          WAZUH_MANAGER="${WazuhNetworkInterface1.PrimaryPrivateIpAddress}" WAZUH_AGENT_NAME="Softether" yum install wazuh-agent -y
+          sed -i '209i\
+            <localfile>\
+              <location>/usr/local/vpnserver/security_log/${NameBurtualHubVPN}/sec_20%y%m%d.log</location>\
+              <log_format>syslog</log_format>\
+            </localfile>' /var/ossec/etc/ossec.conf
+          systemctl daemon-reload
+          systemctl enable wazuh-agent
+          systemctl start wazuh-agent
+          sed -i "s/^enabled=1/enabled=0/" /etc/yum.repos.d/wazuh.repos
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"" /CMD ServerPasswordSet ${SoftetherPassword}
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB DEFAULT /CMD HubDelete DEFAULT
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /CMD HubCreate "${NameBurtualHubVPN}" /PASSWORD:"${SoftetherPassword}"
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB "${NameBurtualHubVPN}" /CMD IPsecEnable /L2TP:yes /L2TPRAW:yes /ETHERIP:yes /PSK:${IPsecPreSharedKey} /DEFAULTHUB:"${NameBurtualHubVPN}"
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /CMD BridgeCreate ${NameBurtualHubVPN} /DEVICE:"eth1"
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD SecureNatEnable
+      Tags:
+        - Key: Name
+          Value: Softether
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc 
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      NetworkInterfaceId: !Ref SoftetherNetworkInterface1
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Ports for Softether connection
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 1701
+          ToPort: 1701
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  InstanceSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SecurityGroup
+# Wazuh
+  WazuhNetworkInterface1:
+    Type: "AWS::EC2::NetworkInterface"
+    Properties:
+      Description: "Additional Network Interface 1"
+      GroupSet:
+        - !Ref SecurityGroup # Security Group ID
+      SubnetId: !Ref SubnetIdPrivateWazuh # Subnet ID
+      Tags:
+        - Key: Name
+          Value: "Softether"
+  WazuhSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Wazuh
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1514
+          ToPort: 1515
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 1514
+          ToPort: 1515
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  WazuhInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref SoftetherInstanceProfile
+      NetworkInterfaces:
+        - 
+          DeviceIndex: 0
+          NetworkInterfaceId: !Ref WazuhNetworkInterface1
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo su
+          sudo yum update -y
+          sudo yum install -y aws-cfn-bootstrap
+          curl -sO https://packages.wazuh.com/4.7/wazuh-install.sh && sudo bash ./wazuh-install.sh -a
+          /usr/share/wazuh-indexer/plugins/opensearch-security/tools/wazuh-passwords-tool.sh -u admin -p ${WazuhPassword}
+          yum install -y wget
+          wget https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/alienvault_reputation.ipset -O /var/ossec/etc/lists/alienvault_reputation.ipset
+          sudo echo "<ATTACKER_IP>" >> /var/ossec/etc/lists/alienvault_reputation.ipset
+          sudo wget https://wazuh.com/resources/iplist-to-cdblist.py -O /tmp/iplist-to-cdblist.py
+          /var/ossec/framework/python/bin/python3 /tmp/iplist-to-cdblist.py /var/ossec/etc/lists/alienvault_reputation.ipset /var/ossec/etc/lists/blacklist-alienvault
+          chown wazuh:wazuh /var/ossec/etc/lists/blacklist-alienvault
+          cat << 'EOF' > /var/ossec/etc/rules/Softether_user_access.xml
+          <group name="Softether_user_access">
+            <rule id="100402" level="0" noalert="1">
+              <decoded_as>softether_decoder_access</decoded_as>
+              <description>Softether access server messages user</description>
+            </rule>
+            <rule id="100404" level="3">
+              <if_sid>100402</if_sid>
+              <match>The new session</match>
+              <description>Softether User authentication successful $(srcuser) with ip $(srcip)</description>
+            </rule>
+          </group>
+          EOF
+          cat << 'EOF' > /var/ossec/etc/rules/softether_rule.xml
+          <group name="softether">
+            <rule id="100302" level="0" noalert="1">
+              <decoded_as>softether_decoder</decoded_as>
+              <description>Softether access server messages grouped</description>
+            </rule>
+            <rule id="100303" level="3">
+              <if_sid>100302</if_sid>
+              <match>VPN</match>
+              <description>Softether remote attempting connection $(srcip) with the user $(srcuser)</description>
+            </rule>
+            <rule id="100304" level="5">
+              <if_sid>100302</if_sid>
+              <match>User authentication failed</match>
+              <description>Softether User authentication failed $(srcuser)</description>
+            </rule>
+            <rule id="100305" level="10">
+              <if_sid>100302</if_sid>
+              <match>VPN</match>
+              <list field="srcip" lookup="address_match_key">etc/lists/blacklist-alienvault</list>
+              <description>IP address found in AlienVault reputation database. $(srcip) and trying to achieve them with this user $(srcuser)</description>
+            </rule>
+            <rule id="100306" level="10" frequency="10" timeframe="120">
+              <if_matched_sid>100304</if_matched_sid>
+              <description>More than 10 login attempts have been recorded in the las 2 minutes $(srcuser)</description>
+            </rule>
+            <rule id="100307" level="10" frequency="10" timeframe="120">
+              <if_matched_sid>100303</if_matched_sid>
+              <description>More than 10 login attempts have been recorded in the las 2 minutes $(srcip)</description>
+            </rule>
+          </group>
+          EOF
+          cat << 'EOF' > /var/ossec/etc/rules/alienvault_rules.xml
+          <group name="attack,">
+              <rule id="100100" level="10">
+                  <if_group>web|attack|attacks</if_group>
+                  <list field="srcip" lookup="address_match_key">etc/lists/blacklist-alienvault</list>
+                  <description>IP address found in AlienVault reputation database.</description>
+              </rule>
+          </group>
+          EOF
+          cat << 'EOF' > /var/ossec/etc/decoders/softether.xml
+          <decoder name="softether_decoder">
+              <prematch type="pcre2">authentication</prematch>
+          </decoder>
+          <decoder name="softether_decoder_child">
+              <parent>softether_decoder</parent>
+              <regex type="pcre2">(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d.\d\d\d\d)</regex>
+              <order>timestamp</order>
+          </decoder>
+          
+          <decoder name="softether_decoder_child">
+              <parent>softether_decoder</parent>
+              <regex type="pcre2">IP address: (\d+\.\d+\.\d+\.\d+)</regex>
+              <order>srcip</order>
+          </decoder>
+          
+          <decoder name="softether_decoder_child">
+              <parent>softether_decoder</parent>
+              <regex type="pcre2">User authentication failed. The user name that has been provided was "(\S+)"</regex>
+              <order>srcuser</order>
+          </decoder>
+          
+          <decoder name="softether_decoder_child">
+              <parent>softether_decoder</parent>
+              <regex type="pcre2">Port number: (\d+)</regex>
+              <order>srcport</order>
+          </decoder>
+          <decoder name="softether_decoder_child">
+              <parent>softether_decoder</parent>
+              <regex type="pcre2">and the user name is "(\S+)"</regex>
+              <order>srcuser</order>
+          </decoder>
+          EOF
+          cat << 'EOF' > /var/ossec/etc/decoders/softether_more.xml
+          <decoder name="Softether_more">
+              <prematch type="pcre2"> VPN Client details</prematch>
+          </decoder>
+          <decoder name="Softether_more_child">
+              <parent>Softether_more</parent>
+              <regex type="pcre2">(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d.\d\d\d\d)</regex>
+              <order>timestamp</order>
+          </decoder>
+          <decoder name="Softether_more_child">
+              <parent>Softether_more</parent>
+              <regex type="pcre2">Client OS name: "(.*?)",</regex>
+              <order>os_system</order>
+          </decoder>
+          
+          <decoder name="Softether_more_child">
+             <parent>Softether_more</parent>
+             <regex type="pcre2">Client host name: (\S+),</regex>
+             <order>user_hostname</order>
+          </decoder>
+
+          <decoder name="Softether_more_child">
+             <parent>Softether_more</parent>
+             <regex type="pcre2">Session "SID-(\S+)-.*?</regex>
+             <order>srcuser</order>
+          </decoder>
+          EOF
+          cat << 'EOF' > /var/ossec/etc/decoders/softether_access.xml
+          <decoder name="softether_decoder_access">
+              <prematch type="pcre2">The new session</prematch>
+          </decoder>
+          <decoder name="softether_decoder_access_child">
+              <parent>softether_decoder_access</parent>
+              <regex type="pcre2">(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d.\d\d\d\d)</regex>
+              <order>timestamp</order>
+          </decoder>
+          <decoder name="softether_decoder_access_child">
+              <parent>softether_decoder_access</parent>
+              <regex type="pcre2">IP address: (\d+\.\d+\.\d+\.\d+),</regex>
+              <order>srcip</order>
+          </decoder>
+          <decoder name="softether_decoder_access_child">
+             <parent>softether_decoder_access</parent>
+             <regex type="pcre2">The new session "SID-(\S+)-.*?</regex>
+             <order>srcuser</order>
+          </decoder>
+          EOF
+          cat << 'EOF' > /var/ossec/etc/rules/softether_more.xml
+          <group name="Softether_more">
+            <rule id="100802" level="0" noalert="1">
+              <decoded_as>Softether_more</decoded_as>
+              <description>Softether mode info access server messages user</description>
+            </rule>
+            <rule id="100804" level="3">
+              <if_sid>100802</if_sid>
+              <match>VPN Client details</match>
+              <description>Softether User authentication successful $(srcuser) with OS $(os_system) and hostname $(user_hostname)</description>
+            </rule>
+          </group>
+          EOF
+          sed -i '331i\ \ \ \ <list>etc/lists/blacklist-alienvault</list>' /var/ossec/etc/ossec.conf
+          sudo systemctl restart wazuh-manager
+      Tags:
+        - Key: Name
+          Value: Wazuh
+      
+Outputs:
+  URLWazuh:
+    Description: Url of Wazuh
+    Value: !Sub "https://${WazuhInstance.PrivateIp}"
+
+  IPSoftether:
+    Description: Ip of the VPN
+    Value: !Sub "${EIP.PublicIp}"
