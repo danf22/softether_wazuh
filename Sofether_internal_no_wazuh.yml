@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Softether on Amazon EC2
+
+Parameters:
+  LatestAmiId :
+    Type : 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
+  NameBurtualHubVPN:
+    Type: String
+    Description: HUB Name Softether VPN.
+  EC2InstanceType:
+    Type: String
+    Description: EC2 instance type for the Softether VPN.
+    Default: t3a.medium
+  IPsecPreSharedKey:
+    Type: String
+    NoEcho: true
+    Description: Ipsec Pre-shared Key.
+  SubnetIdPublicSoftether:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet where the Softether will be deployed need to be Public.
+  SoftetherPassword:
+    Description: "Password for Softether. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
+    
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the EC2 instance will be deployed
+
+Resources:
+  SoftetherInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SoftetherRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Path: /
+  SoftetherInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: SoftetherInstanceProfile
+      Roles:
+        - !Ref SoftetherInstanceRole
+
+  SoftetherNetworkInterface1:
+    Type: "AWS::EC2::NetworkInterface"
+    Properties:
+      Description: "Additional Network Interface 1"
+      GroupSet:
+        - !Ref SecurityGroup # Security Group ID
+      SubnetId: !Ref SubnetIdPublicSoftether # Subnet ID
+      Tags:
+        - Key: Name
+          Value: "Softether"
+  SoftetherConfigVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: 5
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: Softether-Config
+
+  SoftetherInstance:
+    Type: 'AWS::EC2::Instance'
+    DependsOn: 
+      - SoftetherNetworkInterface1
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref SoftetherInstanceProfile
+      Volumes:
+        - Device: /dev/xvdf
+          VolumeId: !Ref SoftetherConfigVolume
+      NetworkInterfaces:
+        - 
+          DeviceIndex: 1
+          GroupSet:
+            - !Ref SecurityGroup # Security Group ID
+          SubnetId: !Ref SubnetIdPublicSoftether # Subnet ID of the primary interface
+        - 
+          DeviceIndex: 0
+          NetworkInterfaceId: !Ref SoftetherNetworkInterface1
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          # Install CloudFormation helper scripts
+          yum install -y aws-cfn-bootstrap
+          
+          # Habilitar IP Forwarding (persistent via sysctl.d)
+          echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ip-forward.conf
+          sysctl --system
+          
+          # Continuar con la instalación de Development Tools, etc.
+          yum -y groupinstall "Development Tools"
+          yum -y update
+          
+          # softether version 4.44
+          cd /usr/local/
+          wget https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz
+          tar xvf softether-vpnserver-*
+          rm -rf softether-vpnserver-*
+          cd vpnserver
+          
+          # Accept license automatically
+          yes 1 | make
+          
+          # Mount the config EBS volume
+          CONFIG_DEV=/dev/xvdf
+          CONFIG_MNT=/mnt/vpnconfig
+          # Format only if no filesystem exists
+          blkid $CONFIG_DEV || mkfs.ext4 $CONFIG_DEV
+          mkdir -p $CONFIG_MNT
+          mount $CONFIG_DEV $CONFIG_MNT
+          # Persist mount across reboots
+          echo "$CONFIG_DEV $CONFIG_MNT ext4 defaults,nofail 0 2" >> /etc/fstab
+          
+          # If config already exists on the EBS volume, restore it
+          FIRST_RUN=true
+          if [ -f $CONFIG_MNT/vpn_server.config ]; then
+            FIRST_RUN=false
+            cp $CONFIG_MNT/vpn_server.config /usr/local/vpnserver/vpn_server.config
+          fi
+          
+          # Create systemd service for vpnserver
+          cat > /etc/systemd/system/vpnserver.service << 'SVCEOF'
+          [Unit]
+          Description=SoftEther VPN Server
+          After=network-online.target
+          Wants=network-online.target
+          
+          [Service]
+          Type=forking
+          ExecStart=/usr/local/vpnserver/vpnserver start
+          ExecStop=/usr/local/vpnserver/vpnserver stop
+          ExecStartPost=/bin/cp /usr/local/vpnserver/vpn_server.config /mnt/vpnconfig/vpn_server.config
+          ExecStopPre=/bin/cp /usr/local/vpnserver/vpn_server.config /mnt/vpnconfig/vpn_server.config
+          Restart=on-failure
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+          
+          systemctl daemon-reload
+          systemctl enable vpnserver
+          systemctl start vpnserver
+          
+          # Wait for VPN server to be ready
+          sleep 5
+          
+          # Only configure if this is the first run (no existing config on EBS)
+          if [ "$FIRST_RUN" = true ]; then
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"" /CMD ServerPasswordSet ${SoftetherPassword}
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB DEFAULT /CMD HubDelete DEFAULT
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /CMD HubCreate "${NameBurtualHubVPN}" /PASSWORD:"${SoftetherPassword}"
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB "${NameBurtualHubVPN}" /CMD IPsecEnable /L2TP:yes /L2TPRAW:yes /ETHERIP:yes /PSK:${IPsecPreSharedKey} /DEFAULTHUB:"${NameBurtualHubVPN}"         
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD SecureNatEnable
+            sleep 5
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD DhcpSet /START:192.168.30.10 /END:192.168.30.200 /MASK:255.255.255.0 /EXPIRE:86400 /GW:192.168.30.1 /DNS:192.168.30.1 /DNS2:8.8.8.8 /DOMAIN:none /LOG:yes /PUSHROUTE:10.0.3.0/255.255.255.0/192.168.30.1
+            # Backup config to EBS
+            cp /usr/local/vpnserver/vpn_server.config $CONFIG_MNT/vpn_server.config
+          fi
+          
+          echo "Configuración de SoftEther VPN completada."
+          
+          # Send success signal
+          /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource SoftetherInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: Softether
+    CreationPolicy:
+        ResourceSignal:
+          Timeout: PT10M
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc 
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      NetworkInterfaceId: !Ref SoftetherNetworkInterface1
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Ports for Softether connection
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 1701
+          ToPort: 1701
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  InstanceSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+       
+      
+Outputs:
+  IPSoftether:
+    Description: Ip of the VPN
+    Value: !Sub "${EIP.PublicIp}"
