@@ -84,7 +84,12 @@ Same as Option A but without any Wazuh components. Only the SoftEther Elastic IP
 
 Deploy `Sofether_external.yml`. Required parameters:
 
-- ACM certificate ARN
+- **ACM certificate ARN (`CertificateArn`)** — the ARN of an AWS Certificate Manager certificate used for TLS termination on the NLB (port 443). Requirements:
+  - The certificate must be a public ACM certificate issued or imported in the **same AWS region** as the stack.
+  - It must cover the domain name you will point to the NLB (e.g. `vpn.example.com`).
+  - The certificate must be in **Issued** status before deploying the stack.
+  - The NLB listener uses SSL policy `ELBSecurityPolicy-TLS13-1-2-2021-06`, so the certificate must support TLS 1.2/1.3.
+  - After deployment, create a CNAME record on your domain pointing to the NLB DNS name shown in the stack Outputs.
 - Wazuh and SoftEther passwords
 - Private subnet IDs (for SoftEther and Wazuh)
 - Two public subnet IDs (for the NLB)

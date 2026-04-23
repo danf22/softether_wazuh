@@ -5,6 +5,14 @@ Parameters:
   LatestAmiId :
     Type : 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
+  SoftEtherDownloadUrl:
+    Type: String
+    Description: Full download URL for the SoftEther VPN Server tarball (.tar.gz) from GitHub releases.
+    Default: https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz
+  WazuhVersion:
+    Type: String
+    Description: Wazuh version to install (e.g. 4.14). Used for the install script URL and the agent yum repo.
+    Default: '4.14'
   NameBurtualHubVPN:
     Type: String
     Description: HUB Name Softether VPN.
@@ -125,9 +133,9 @@ Resources:
           yum -y groupinstall "Development Tools"
           yum -y update
           
-          # softether version 4.44
+          # softether version
           cd /usr/local/
-          wget https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz
+          wget ${SoftEtherDownloadUrl}
           tar xvf softether-vpnserver-*
           rm -rf softether-vpnserver-*
           cd vpnserver
@@ -351,7 +359,7 @@ Resources:
           fi
           
           # Install Wazuh
-          curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh && bash ./wazuh-install.sh -a
+          curl -sO https://packages.wazuh.com/${WazuhVersion}/wazuh-install.sh && bash ./wazuh-install.sh -a
           /usr/share/wazuh-indexer/plugins/opensearch-security/tools/wazuh-passwords-tool.sh -u admin -p ${WazuhPassword}
           yum install -y wget
           
