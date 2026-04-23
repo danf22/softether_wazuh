@@ -19,6 +19,7 @@ Parameters:
   NameBurtualHubVPN:
     Type: String
     Description: HUB Name Softether VPN.
+    Default: VPN
   EC2InstanceType:
     Type: String
     Description: EC2 instance type for the Softether VPN.
@@ -27,6 +28,7 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Ipsec Pre-shared Key.
+    Default: vpn
   SubnetIdPrivateSoftether:
     Type: AWS::EC2::Subnet::Id
     Description: Subnet where the Softether will be deployed need to be Private.
@@ -54,6 +56,7 @@ Parameters:
       The password for a resource. Must be between 8 and 64 characters and
       contain at least one uppercase letter, one lowercase letter, one number,
       and one of the following symbols: .*+?-'
+    Default: MyW4zuh+Pass
     MinLength: 8
     MaxLength: 64
     AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?''-]).{8,64}$'
@@ -98,17 +101,6 @@ Resources:
       Tags:
         - Key: Name
           Value: Softether
-  SoftetherConfigVolume:
-    Type: AWS::EC2::Volume
-    DeletionPolicy: Retain
-    Properties:
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Size: 5
-      VolumeType: gp3
-      Encrypted: true
-      Tags:
-        - Key: Name
-          Value: Softether-Config
 
   SoftetherInstance:
     Type: AWS::EC2::Instance
@@ -116,19 +108,21 @@ Resources:
       - SoftetherNetworkInterface1
       - WazuhInstance
     Properties:
-      AvailabilityZone: !Select [0, !GetAZs '']
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref EC2InstanceType
       IamInstanceProfile: !Ref SoftetherInstanceProfile
-      Volumes:
-        - Device: /dev/xvdf
-          VolumeId: !Ref SoftetherConfigVolume
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
-            VolumeSize: 50 # Size of the EBS volume (in GB)
-            Encrypted: true # Enables encryption for the EBS volume
-            VolumeType: gp3 # General Purpose SSD
+            VolumeSize: 50
+            Encrypted: true
+            VolumeType: gp3
+        - DeviceName: /dev/xvdf
+          Ebs:
+            VolumeSize: 5
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: false
       NetworkInterfaces:
         - DeviceIndex: 1
           GroupSet:
@@ -164,9 +158,15 @@ Resources:
           # Accept license automatically
           yes 1 | make
           
-          # Mount the config EBS volume
-          CONFIG_DEV=/dev/xvdf
+          # Mount the config EBS volume - resolve NVMe device name on Nitro instances
           CONFIG_MNT=/mnt/vpnconfig
+          # On Nitro instances /dev/xvdf appears as /dev/nvme*
+          if [ -b /dev/xvdf ]; then
+            CONFIG_DEV=/dev/xvdf
+          else
+            # Fallback: second NVMe device (nvme1n1) since nvme0n1 is the root
+            CONFIG_DEV=/dev/nvme1n1
+          fi
           # Format only if no filesystem exists
           blkid $CONFIG_DEV || mkfs.ext4 $CONFIG_DEV
           mkdir -p $CONFIG_MNT
@@ -322,17 +322,6 @@ Resources:
       Tags:
         - Key: Name
           Value: Softether
-  WazuhConfigVolume:
-    Type: AWS::EC2::Volume
-    DeletionPolicy: Retain
-    Properties:
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Size: 10
-      VolumeType: gp3
-      Encrypted: true
-      Tags:
-        - Key: Name
-          Value: Wazuh-Config
   WazuhSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -350,19 +339,21 @@ Resources:
   WazuhInstance:
     Type: AWS::EC2::Instance
     Properties:
-      AvailabilityZone: !Select [0, !GetAZs '']
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref EC2InstanceType
       IamInstanceProfile: !Ref SoftetherInstanceProfile
-      Volumes:
-        - Device: /dev/xvdg
-          VolumeId: !Ref WazuhConfigVolume
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
-            VolumeSize: 100 # Size of the EBS volume (in GB)
-            Encrypted: true # Enables encryption for the EBS volume
-            VolumeType: gp3 # General Purpose SSD
+            VolumeSize: 100
+            Encrypted: true
+            VolumeType: gp3
+        - DeviceName: /dev/xvdg
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: false
       NetworkInterfaces:
         - DeviceIndex: 0
           NetworkInterfaceId: !Ref WazuhNetworkInterface1
@@ -376,9 +367,14 @@ Resources:
           yum install -y aws-cfn-bootstrap
           yum update -y
           
-          # Mount the Wazuh config EBS volume
-          WCONFIG_DEV=/dev/xvdg
+          # Mount the Wazuh config EBS volume - resolve NVMe device name on Nitro instances
           WCONFIG_MNT=/mnt/wazuhconfig
+          if [ -b /dev/xvdg ]; then
+            WCONFIG_DEV=/dev/xvdg
+          else
+            # On Nitro instances, second EBS is nvme1n1
+            WCONFIG_DEV=/dev/nvme1n1
+          fi
           blkid $WCONFIG_DEV || mkfs.ext4 $WCONFIG_DEV
           mkdir -p $WCONFIG_MNT
           mount $WCONFIG_DEV $WCONFIG_MNT
