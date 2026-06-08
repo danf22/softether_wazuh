@@ -5,14 +5,9 @@ Parameters:
   LatestAmiId :
     Type : 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
-  SoftEtherDownloadUrl:
-    Type: String
-    Description: Full download URL for the SoftEther VPN Server tarball (.tar.gz) from GitHub releases.
-    Default: https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz
   NameBurtualHubVPN:
     Type: String
     Description: HUB Name Softether VPN.
-    Default: VPN
   EC2InstanceType:
     Type: String
     Description: EC2 instance type for the Softether VPN.
@@ -21,7 +16,16 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Ipsec Pre-shared Key.
-    Default: vpn
+  DefaultVPNUser:
+    Type: String
+    Description: Default VPN user name to create.
+  DefaultVPNUserPassword:
+    Description: "Password for the default VPN user. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
   SubnetIdPublicSoftether:
     Type: AWS::EC2::Subnet::Id
     Description: Subnet where the Softether will be deployed need to be Public.
@@ -29,7 +33,6 @@ Parameters:
     Description: "Password for Softether. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
     Type: String
     NoEcho: true
-    Default: "Passw0rd.1"
     MinLength: 8
     MaxLength: 64
     AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
@@ -70,22 +73,30 @@ Resources:
       Tags:
         - Key: Name
           Value: "Softether"
+  SoftetherConfigVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: 5
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: Softether-Config
 
   SoftetherInstance:
     Type: 'AWS::EC2::Instance'
     DependsOn: 
       - SoftetherNetworkInterface1
     Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref EC2InstanceType
       IamInstanceProfile: !Ref SoftetherInstanceProfile
-      BlockDeviceMappings:
-        - DeviceName: /dev/xvdf
-          Ebs:
-            VolumeSize: 5
-            VolumeType: gp3
-            Encrypted: true
-            DeleteOnTermination: false
+      Volumes:
+        - Device: /dev/xvdf
+          VolumeId: !Ref SoftetherConfigVolume
       NetworkInterfaces:
         - 
           DeviceIndex: 1
@@ -113,9 +124,9 @@ Resources:
           yum -y groupinstall "Development Tools"
           yum -y update
           
-          # softether version
+          # softether version 4.44
           cd /usr/local/
-          wget ${SoftEtherDownloadUrl}
+          wget https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz
           tar xvf softether-vpnserver-*
           rm -rf softether-vpnserver-*
           cd vpnserver
@@ -123,15 +134,9 @@ Resources:
           # Accept license automatically
           yes 1 | make
           
-          # Mount the config EBS volume - resolve NVMe device name on Nitro instances
+          # Mount the config EBS volume
+          CONFIG_DEV=/dev/xvdf
           CONFIG_MNT=/mnt/vpnconfig
-          # On Nitro instances /dev/xvdf appears as /dev/nvme*
-          if [ -b /dev/xvdf ]; then
-            CONFIG_DEV=/dev/xvdf
-          else
-            # Fallback: second NVMe device (nvme1n1) since nvme0n1 is the root
-            CONFIG_DEV=/dev/nvme1n1
-          fi
           # Format only if no filesystem exists
           blkid $CONFIG_DEV || mkfs.ext4 $CONFIG_DEV
           mkdir -p $CONFIG_MNT
@@ -157,21 +162,24 @@ Resources:
           Type=forking
           ExecStart=/usr/local/vpnserver/vpnserver start
           ExecStop=/usr/local/vpnserver/vpnserver stop
-          ExecStartPost=/bin/cp /usr/local/vpnserver/vpn_server.config /mnt/vpnconfig/vpn_server.config
-          ExecStopPre=/bin/cp /usr/local/vpnserver/vpn_server.config /mnt/vpnconfig/vpn_server.config
           Restart=on-failure
           RestartSec=5
           
           [Install]
           WantedBy=multi-user.target
           SVCEOF
+          # Strip leading whitespace from the unit file
+          sed -i 's/^[[:space:]]*//' /etc/systemd/system/vpnserver.service
           
           systemctl daemon-reload
           systemctl enable vpnserver
           systemctl start vpnserver
           
-          # Wait for VPN server to be ready
-          sleep 5
+          # Wait for VPN server to be listening
+          for i in $(seq 1 30); do
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"" /CMD About && break
+            sleep 2
+          done
           
           # Only configure if this is the first run (no existing config on EBS)
           if [ "$FIRST_RUN" = true ]; then
@@ -182,8 +190,14 @@ Resources:
             /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD SecureNatEnable
             sleep 5
             /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD DhcpSet /START:192.168.30.10 /END:192.168.30.200 /MASK:255.255.255.0 /EXPIRE:86400 /GW:192.168.30.1 /DNS:192.168.30.1 /DNS2:8.8.8.8 /DOMAIN:none /LOG:yes /PUSHROUTE:10.0.3.0/255.255.255.0/192.168.30.1
+            # Create default VPN user
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD UserCreate "${DefaultVPNUser}" /GROUP:none /REALNAME:none /NOTE:none
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD UserPasswordSet "${DefaultVPNUser}" /PASSWORD:"${DefaultVPNUserPassword}"
             # Backup config to EBS
-            cp /usr/local/vpnserver/vpn_server.config $CONFIG_MNT/vpn_server.config
+            sleep 3
+            if [ -f /usr/local/vpnserver/vpn_server.config ]; then
+              cp /usr/local/vpnserver/vpn_server.config $CONFIG_MNT/vpn_server.config
+            fi
           fi
           
           echo "Configuración de SoftEther VPN completada."

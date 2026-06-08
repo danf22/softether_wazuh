@@ -5,18 +5,9 @@ Parameters:
   LatestAmiId :
     Type : 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
-  SoftEtherDownloadUrl:
-    Type: String
-    Description: Full download URL for the SoftEther VPN Server tarball (.tar.gz) from GitHub releases.
-    Default: https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz
-  WazuhVersion:
-    Type: String
-    Description: Wazuh version to install (e.g. 4.14). Used for the install script URL and the agent yum repo.
-    Default: '4.14'
   NameBurtualHubVPN:
     Type: String
     Description: HUB Name Softether VPN.
-    Default: VPN
   EC2InstanceType:
     Type: String
     Description: EC2 instance type for the Softether VPN.
@@ -25,7 +16,16 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Ipsec Pre-shared Key.
-    Default: vpn
+  DefaultVPNUser:
+    Type: String
+    Description: Default VPN user name to create.
+  DefaultVPNUserPassword:
+    Description: "Password for the default VPN user. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
   SubnetIdPublicSoftether:
     Type: AWS::EC2::Subnet::Id
     Description: Subnet where the Softether will be deployed need to be Public.
@@ -36,7 +36,6 @@ Parameters:
     Description: "Password for Softether. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
     Type: String
     NoEcho: true
-    Default: "Passw0rd.1"
     MinLength: 8
     MaxLength: 64
     AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
@@ -44,7 +43,6 @@ Parameters:
     Description: "Password for Wazuh. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
     Type: String
     NoEcho: true
-    Default: "Passw0rd.1"
     MinLength: 8
     MaxLength: 64
     AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
@@ -85,6 +83,17 @@ Resources:
       Tags:
         - Key: Name
           Value: "Softether"
+  SoftetherConfigVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: 5
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: Softether-Config
 
   SoftetherInstance:
     Type: 'AWS::EC2::Instance'
@@ -92,16 +101,13 @@ Resources:
       - SoftetherNetworkInterface1
       - WazuhInstance
     Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref EC2InstanceType
       IamInstanceProfile: !Ref SoftetherInstanceProfile
-      BlockDeviceMappings:
-        - DeviceName: /dev/xvdf
-          Ebs:
-            VolumeSize: 5
-            VolumeType: gp3
-            Encrypted: true
-            DeleteOnTermination: false
+      Volumes:
+        - Device: /dev/xvdf
+          VolumeId: !Ref SoftetherConfigVolume
       NetworkInterfaces:
         - 
           DeviceIndex: 1
@@ -129,9 +135,9 @@ Resources:
           yum -y groupinstall "Development Tools"
           yum -y update
           
-          # softether version
+          # softether version 4.44
           cd /usr/local/
-          wget ${SoftEtherDownloadUrl}
+          wget https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz
           tar xvf softether-vpnserver-*
           rm -rf softether-vpnserver-*
           cd vpnserver
@@ -139,19 +145,9 @@ Resources:
           # Accept license automatically
           yes 1 | make
           
-          # Mount the config EBS volume - resolve NVMe device name on Nitro instances
+          # Mount the config EBS volume
+          CONFIG_DEV=/dev/xvdf
           CONFIG_MNT=/mnt/vpnconfig
-          # On Nitro instances /dev/xvdf appears as /dev/nvme*
-          if [ -b /dev/xvdf ]; then
-            CONFIG_DEV=/dev/xvdf
-          else
-            # Find the NVMe device mapped to xvdf using lsblk or nvme id-ctrl
-            CONFIG_DEV=$(readlink -f /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_* 2>/dev/null | grep -v "$(readlink -f /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*p1 2>/dev/null || echo 'NONE')" | head -1)
-            if [ -z "$CONFIG_DEV" ]; then
-              # Fallback: second NVMe device (nvme1n1) since nvme0n1 is the root
-              CONFIG_DEV=/dev/nvme1n1
-            fi
-          fi
           # Format only if no filesystem exists
           blkid $CONFIG_DEV || mkfs.ext4 $CONFIG_DEV
           mkdir -p $CONFIG_MNT
@@ -177,21 +173,24 @@ Resources:
           Type=forking
           ExecStart=/usr/local/vpnserver/vpnserver start
           ExecStop=/usr/local/vpnserver/vpnserver stop
-          ExecStartPost=/bin/cp /usr/local/vpnserver/vpn_server.config /mnt/vpnconfig/vpn_server.config
-          ExecStopPre=/bin/cp /usr/local/vpnserver/vpn_server.config /mnt/vpnconfig/vpn_server.config
           Restart=on-failure
           RestartSec=5
           
           [Install]
           WantedBy=multi-user.target
           SVCEOF
+          # Strip leading whitespace from the unit file
+          sed -i 's/^[[:space:]]*//' /etc/systemd/system/vpnserver.service
           
           systemctl daemon-reload
           systemctl enable vpnserver
           systemctl start vpnserver
           
-          # Wait for VPN server to be ready
-          sleep 5
+          # Wait for VPN server to be listening
+          for i in $(seq 1 30); do
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"" /CMD About && break
+            sleep 2
+          done
           
           rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
           cat << 'EOF' > /etc/yum.repos.d/wazuh.repo
@@ -221,8 +220,14 @@ Resources:
             /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD SecureNatEnable
             sleep 5
             /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD DhcpSet /START:192.168.30.10 /END:192.168.30.200 /MASK:255.255.255.0 /EXPIRE:86400 /GW:192.168.30.1 /DNS:192.168.30.1 /DNS2:8.8.8.8 /DOMAIN:none /LOG:yes /PUSHROUTE:10.0.3.0/255.255.255.0/192.168.30.1
+            # Create default VPN user
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD UserCreate "${DefaultVPNUser}" /GROUP:none /REALNAME:none /NOTE:none
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD UserPasswordSet "${DefaultVPNUser}" /PASSWORD:"${DefaultVPNUserPassword}"
             # Backup config to EBS
-            cp /usr/local/vpnserver/vpn_server.config $CONFIG_MNT/vpn_server.config
+            sleep 3
+            if [ -f /usr/local/vpnserver/vpn_server.config ]; then
+              cp /usr/local/vpnserver/vpn_server.config $CONFIG_MNT/vpn_server.config
+            fi
           fi
           
           echo "Configuración de SoftEther VPN completada."
@@ -283,6 +288,17 @@ Resources:
       Tags:
         - Key: Name
           Value: "Softether"
+  WazuhConfigVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: 10
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: Wazuh-Config
   WazuhSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -310,9 +326,13 @@ Resources:
   WazuhInstance:
     Type: 'AWS::EC2::Instance'
     Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref EC2InstanceType
       IamInstanceProfile: !Ref SoftetherInstanceProfile
+      Volumes:
+        - Device: /dev/xvdg
+          VolumeId: !Ref WazuhConfigVolume
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
@@ -320,12 +340,6 @@ Resources:
             VolumeType: gp3
             Iops: 3000
             DeleteOnTermination: true
-        - DeviceName: /dev/xvdg
-          Ebs:
-            VolumeSize: 10
-            VolumeType: gp3
-            Encrypted: true
-            DeleteOnTermination: false
 
       NetworkInterfaces:
         - 
@@ -341,14 +355,9 @@ Resources:
           yum install -y aws-cfn-bootstrap
           yum update -y
           
-          # Mount the Wazuh config EBS volume - resolve NVMe device name on Nitro instances
+          # Mount the Wazuh config EBS volume
+          WCONFIG_DEV=/dev/xvdg
           WCONFIG_MNT=/mnt/wazuhconfig
-          if [ -b /dev/xvdg ]; then
-            WCONFIG_DEV=/dev/xvdg
-          else
-            # On Nitro instances, second EBS is nvme1n1
-            WCONFIG_DEV=/dev/nvme1n1
-          fi
           blkid $WCONFIG_DEV || mkfs.ext4 $WCONFIG_DEV
           mkdir -p $WCONFIG_MNT
           mount $WCONFIG_DEV $WCONFIG_MNT
@@ -361,7 +370,7 @@ Resources:
           fi
           
           # Install Wazuh
-          curl -sO https://packages.wazuh.com/${WazuhVersion}/wazuh-install.sh && bash ./wazuh-install.sh -a
+          curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh && bash ./wazuh-install.sh -a
           /usr/share/wazuh-indexer/plugins/opensearch-security/tools/wazuh-passwords-tool.sh -u admin -p ${WazuhPassword}
           yum install -y wget
           
@@ -535,6 +544,30 @@ Resources:
           fi
           
           systemctl restart wazuh-manager
+          
+          # Import Wazuh dashboard visualizations
+          # Wait for the dashboard to be ready
+          for i in $(seq 1 60); do
+            curl -sk https://localhost:443 && break
+            sleep 5
+          done
+          sleep 10
+          
+          # Create the wazuh-alerts-* index pattern required by visualizations
+          curl -sk -X POST "https://localhost:443/api/saved_objects/index-pattern/wazuh-alerts-*" \
+            -H "osd-xsrf: true" \
+            -H "Content-Type: application/json" \
+            -u "admin:${WazuhPassword}" \
+            -d '{"attributes":{"title":"wazuh-alerts-*","timeFieldName":"timestamp"}}'
+          
+          # Download and import the visualizations
+          wget -q https://raw.githubusercontent.com/danf22/softether_wazuh/main/Visualizations.ndjson -O /tmp/Visualizations.ndjson
+          curl -sk -X POST "https://localhost:443/api/saved_objects/_import?overwrite=true" \
+            -H "osd-xsrf: true" \
+            -u "admin:${WazuhPassword}" \
+            -F "file=@/tmp/Visualizations.ndjson"
+          rm -f /tmp/Visualizations.ndjson
+          
           INSTALL_STATUS=$?
           /opt/aws/bin/cfn-signal -e $INSTALL_STATUS --stack ${AWS::StackName} --resource WazuhInstance --region ${AWS::Region}
       Tags:
