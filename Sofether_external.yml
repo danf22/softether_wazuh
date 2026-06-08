@@ -227,6 +227,84 @@ Resources:
           yum install wazuh-agent -y
           sed -i "s|<address>MANAGER_IP</address>|<address>${WazuhInstance.PrivateIp}</address>|g" /var/ossec/etc/ossec.conf
           sed -i '/<\/ossec_config>/i \ \ <localfile>\n\ \ \ <location>/usr/local/vpnserver/security_log/${NameBurtualHubVPN}/sec_20%y%m%d.log</location>\n\ \ \ <log_format>syslog</log_format>\n\ \ </localfile>' /var/ossec/etc/ossec.conf
+          # Add traffic monitoring log to Wazuh agent
+          sed -i '/<\/ossec_config>/i \ \ <localfile>\n\ \ \ <location>/var/log/softether-traffic.log</location>\n\ \ \ <log_format>syslog</log_format>\n\ \ </localfile>' /var/ossec/etc/ossec.conf
+          
+          # Create traffic monitoring script
+          cat > /usr/local/bin/softether-traffic-monitor.sh << 'MONEOF'
+          #!/bin/bash
+          VPNCMD=/usr/local/vpnserver/vpncmd
+          HUB_NAME=$(grep -oP 'declare HubList.*?{.*?string Name (.*?)$' /usr/local/vpnserver/vpn_server.config 2>/dev/null | head -1 | awk '{print $NF}' || echo "VPN")
+          PASSWORD_FILE=/usr/local/vpnserver/.server_password
+          LOG_FILE=/var/log/softether-traffic.log
+          BASELINE_DIR=/var/lib/softether-monitor
+          mkdir -p $BASELINE_DIR
+          if [ -f "$PASSWORD_FILE" ]; then
+            SVR_PASS=$(cat "$PASSWORD_FILE")
+          else
+            SVR_PASS=""
+          fi
+          SESSIONS=$($VPNCMD localhost /SERVER /PASSWORD:"$SVR_PASS" /HUB:"$HUB_NAME" /CMD SessionList 2>/dev/null | grep -E "^SID-" | awk '{print $1}')
+          for SESSION in $SESSIONS; do
+            INFO=$($VPNCMD localhost /SERVER /PASSWORD:"$SVR_PASS" /HUB:"$HUB_NAME" /CMD SessionGet "$SESSION" 2>/dev/null)
+            USERNAME=$(echo "$INFO" | grep "User Name" | head -1 | awk -F'|' '{print $2}' | xargs)
+            SRC_IP=$(echo "$INFO" | grep "Client IP Address" | head -1 | awk -F'|' '{print $2}' | xargs)
+            TX_BYTES=$(echo "$INFO" | grep "Outgoing Data Size" | head -1 | awk -F'|' '{print $2}' | grep -oP '\d+')
+            RX_BYTES=$(echo "$INFO" | grep "Incoming Data Size" | head -1 | awk -F'|' '{print $2}' | grep -oP '\d+')
+            TX_PACKETS=$(echo "$INFO" | grep "Outgoing Unicast Packets" | head -1 | awk -F'|' '{print $2}' | grep -oP '\d+')
+            RX_PACKETS=$(echo "$INFO" | grep "Incoming Unicast Packets" | head -1 | awk -F'|' '{print $2}' | grep -oP '\d+')
+            CONN_TIME=$(echo "$INFO" | grep "Connection Started at" | head -1 | awk -F'|' '{print $2}' | xargs)
+            [ -z "$USERNAME" ] && continue
+            [ -z "$TX_BYTES" ] && TX_BYTES=0
+            [ -z "$RX_BYTES" ] && RX_BYTES=0
+            [ -z "$TX_PACKETS" ] && TX_PACKETS=0
+            [ -z "$RX_PACKETS" ] && RX_PACKETS=0
+            BASELINE_FILE="$BASELINE_DIR/${SESSION}.baseline"
+            PREV_TX=0; PREV_RX=0
+            if [ -f "$BASELINE_FILE" ]; then
+              PREV_TX=$(awk 'NR==1' "$BASELINE_FILE")
+              PREV_RX=$(awk 'NR==2' "$BASELINE_FILE")
+            fi
+            echo "$TX_BYTES" > "$BASELINE_FILE"
+            echo "$RX_BYTES" >> "$BASELINE_FILE"
+            DELTA_TX=$((TX_BYTES - PREV_TX))
+            DELTA_RX=$((RX_BYTES - PREV_RX))
+            [ "$DELTA_TX" -lt 0 ] && DELTA_TX=$TX_BYTES
+            [ "$DELTA_RX" -lt 0 ] && DELTA_RX=$RX_BYTES
+            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+            echo "$TIMESTAMP softether-traffic: session=$SESSION user=$USERNAME srcip=$SRC_IP tx_bytes=$TX_BYTES rx_bytes=$RX_BYTES delta_tx=$DELTA_TX delta_rx=$DELTA_RX tx_packets=$TX_PACKETS rx_packets=$RX_PACKETS connected_since=\"$CONN_TIME\"" >> "$LOG_FILE"
+            THRESHOLD=104857600
+            if [ "$DELTA_TX" -gt "$THRESHOLD" ] || [ "$DELTA_RX" -gt "$THRESHOLD" ]; then
+              echo "$TIMESTAMP softether-traffic-alert: HIGH_TRAFFIC session=$SESSION user=$USERNAME srcip=$SRC_IP delta_tx=$DELTA_TX delta_rx=$DELTA_RX" >> "$LOG_FILE"
+            fi
+            if [ "$TX_PACKETS" -gt 0 ] && [ "$RX_PACKETS" -gt 0 ]; then
+              RATIO=$((TX_PACKETS / RX_PACKETS))
+              if [ "$RATIO" -gt 50 ]; then
+                echo "$TIMESTAMP softether-traffic-alert: UNUSUAL_PACKET_RATIO session=$SESSION user=$USERNAME srcip=$SRC_IP tx_packets=$TX_PACKETS rx_packets=$RX_PACKETS ratio=$RATIO" >> "$LOG_FILE"
+              fi
+            fi
+          done
+          for BFILE in $BASELINE_DIR/*.baseline; do
+            [ -f "$BFILE" ] || continue
+            BSESSION=$(basename "$BFILE" .baseline)
+            echo "$SESSIONS" | grep -q "$BSESSION" || rm -f "$BFILE"
+          done
+          MONEOF
+          sed -i 's/^[[:space:]]*//' /usr/local/bin/softether-traffic-monitor.sh
+          chmod +x /usr/local/bin/softether-traffic-monitor.sh
+          echo "${SoftetherPassword}" > /usr/local/vpnserver/.server_password
+          chmod 600 /usr/local/vpnserver/.server_password
+          cat > /etc/logrotate.d/softether-traffic << 'LREOF'
+          /var/log/softether-traffic.log {
+              daily
+              rotate 30
+              compress
+              missingok
+              notifempty
+          }
+          LREOF
+          echo "*/5 * * * * root /usr/local/bin/softether-traffic-monitor.sh" > /etc/cron.d/softether-traffic-monitor
+          
           sudo systemctl daemon-reload
           sudo systemctl enable wazuh-agent
           sudo systemctl start wazuh-agent
@@ -557,6 +635,51 @@ Resources:
               <if_sid>100802</if_sid>
               <match>VPN Client details</match>
               <description>Softether User authentication successful $(srcuser) with OS $(os_system) and hostname $(user_hostname)</description>
+            </rule>
+          </group>
+          EOF
+            # Traffic monitoring decoder and rules
+            cat << 'EOF' > /var/ossec/etc/decoders/softether_traffic.xml
+          <decoder name="softether_traffic_decoder">
+              <prematch type="pcre2">softether-traffic:</prematch>
+          </decoder>
+          <decoder name="softether_traffic_decoder_child">
+              <parent>softether_traffic_decoder</parent>
+              <regex type="pcre2">user=(\S+) srcip=(\S+) tx_bytes=(\d+) rx_bytes=(\d+) delta_tx=(\d+) delta_rx=(\d+)</regex>
+              <order>srcuser, srcip, tx_bytes, rx_bytes, delta_tx, delta_rx</order>
+          </decoder>
+          <decoder name="softether_traffic_alert_decoder">
+              <prematch type="pcre2">softether-traffic-alert:</prematch>
+          </decoder>
+          <decoder name="softether_traffic_alert_decoder_child">
+              <parent>softether_traffic_alert_decoder</parent>
+              <regex type="pcre2">(\S+) session=\S+ user=(\S+) srcip=(\S+)</regex>
+              <order>alert_type, srcuser, srcip</order>
+          </decoder>
+          EOF
+            cat << 'EOF' > /var/ossec/etc/rules/softether_traffic.xml
+          <group name="softether_traffic">
+            <rule id="100900" level="0" noalert="1">
+              <decoded_as>softether_traffic_decoder</decoded_as>
+              <description>SoftEther VPN traffic monitoring event</description>
+            </rule>
+            <rule id="100901" level="10">
+              <decoded_as>softether_traffic_alert_decoder</decoded_as>
+              <match>HIGH_TRAFFIC</match>
+              <description>SoftEther HIGH TRAFFIC detected: user $(srcuser) from $(srcip) transferred over 100MB in 5 minutes</description>
+            </rule>
+            <rule id="100902" level="12">
+              <decoded_as>softether_traffic_alert_decoder</decoded_as>
+              <match>UNUSUAL_PACKET_RATIO</match>
+              <description>SoftEther UNUSUAL PACKET RATIO detected: user $(srcuser) from $(srcip) - possible port scanning or DDoS</description>
+            </rule>
+            <rule id="100903" level="13" frequency="3" timeframe="1800">
+              <if_matched_sid>100901</if_matched_sid>
+              <description>SoftEther SUSTAINED HIGH TRAFFIC: user $(srcuser) from $(srcip) - possible data exfiltration</description>
+            </rule>
+            <rule id="100904" level="14" frequency="3" timeframe="900">
+              <if_matched_sid>100902</if_matched_sid>
+              <description>SoftEther REPEATED UNUSUAL TRAFFIC PATTERN: user $(srcuser) from $(srcip) - active attack suspected</description>
             </rule>
           </group>
           EOF
