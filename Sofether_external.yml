@@ -259,7 +259,7 @@ Resources:
             [ -z "$RX_BYTES" ] && RX_BYTES=0
             [ -z "$TX_PACKETS" ] && TX_PACKETS=0
             [ -z "$RX_PACKETS" ] && RX_PACKETS=0
-            BASELINE_FILE="$BASELINE_DIR/${SESSION}.baseline"
+            BASELINE_FILE="$BASELINE_DIR/$SESSION.baseline"
             PREV_TX=0; PREV_RX=0
             if [ -f "$BASELINE_FILE" ]; then
               PREV_TX=$(awk 'NR==1' "$BASELINE_FILE")

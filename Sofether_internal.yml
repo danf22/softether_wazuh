@@ -249,7 +249,7 @@ Resources:
             [ -z "$RX_PACKETS" ] && RX_PACKETS=0
             
             # Calculate traffic rate (bytes since last check)
-            BASELINE_FILE="$BASELINE_DIR/${SESSION}.baseline"
+            BASELINE_FILE="$BASELINE_DIR/$SESSION.baseline"
             PREV_TX=0
             PREV_RX=0
             if [ -f "$BASELINE_FILE" ]; then
