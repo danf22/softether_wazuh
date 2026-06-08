@@ -1,121 +1,149 @@
-# Deploy SoftEther and Wazuh using CloudFormation on AWS
+# Deploy SoftEther VPN and Wazuh on AWS with CloudFormation
 
-This project deploys SoftEther VPN and optionally Wazuh (an open-source security monitoring platform) on Amazon Web Services (AWS) using CloudFormation. It monitors and blocks malicious IPs through an Infrastructure as Code (IaC) approach, leveraging AWS CloudFormation stacks to provision all necessary resources.
+This project deploys SoftEther VPN and optionally Wazuh (an open-source security monitoring platform) on Amazon Web Services using CloudFormation. It provides automated VPN provisioning with persistent configuration, malicious IP detection via AlienVault reputation lists, and a pre-built monitoring dashboard — all through Infrastructure as Code.
 
 ## Templates
 
 | Template | Description |
 |---|---|
-| `vpc.yml` | VPC with public and private subnets |
-| `Sofether_internal.yml` | SoftEther + Wazuh with a public Elastic IP |
+| `vpc.yml` | VPC with 2 public and 2 private subnets, NAT Gateway, and routing |
+| `Sofether_internal.yml` | SoftEther + Wazuh with a public Elastic IP (direct internet access) |
 | `Sofether_internal_no_wazuh.yml` | SoftEther only (no Wazuh) with a public Elastic IP |
 | `Sofether_external.yml` | SoftEther + Wazuh behind an NLB with TLS termination |
 
 ## Architecture
 
-All SoftEther templates share these characteristics:
+All templates share these characteristics:
 
-- **systemd service** for vpnserver — works consistently across Amazon Linux 2 and AL2023 AMIs
-- **Persistent VPN configuration** on a dedicated encrypted EBS volume (`/dev/xvdf`, mounted at `/mnt/vpnconfig`). On first deploy the VPN is configured from scratch and the config is backed up to the EBS. On subsequent deploys (e.g. AMI update) the existing config is restored automatically — no reconfiguration needed.
+- **Amazon Linux 2** AMI (auto-resolved via SSM parameter)
+- **Nitro instance support** (t3a.medium default) — handles NVMe device naming
+- **systemd service** for vpnserver with automatic config backup on start/stop
+- **Persistent VPN configuration** on a dedicated encrypted EBS volume (`DeletionPolicy: Retain`). First deploy configures from scratch; subsequent deploys restore existing config automatically
+- **Default VPN user** created during first deployment via parameters
 - **IP forwarding** persisted via `/etc/sysctl.d/99-ip-forward.conf`
-- **cfn-signal** for reliable CloudFormation stack creation feedback
+- **cfn-signal** for reliable CloudFormation creation feedback
+- **Wazuh agent** on SoftEther instance (templates with Wazuh) forwarding VPN security logs
+- **Automatic dashboard import** — visualizations and dashboard are imported into Wazuh during deployment
 
-The EBS config volume uses `DeletionPolicy: Retain` so it survives stack deletes.
+### Wazuh Features (templates with Wazuh)
 
-## How It Works
+- AlienVault IP reputation database integration
+- Custom decoders for SoftEther VPN log parsing
+- Custom rules for authentication events, brute-force detection, and malicious IP alerts
+- Pre-configured dashboard with OS, Country, City, VPN Map, AlienVault IP table, and user authentication table
+- Active response capability for blocking malicious IPs
 
-The deployment requires a VPC with a minimum of three availability zones. The CloudFormation templates for this setup are available in this repository.
+## Parameters
 
-For templates that include Wazuh, the CloudFormation stack installs and configures the Wazuh agent on the SoftEther instance. This agent collects application logs and sends them to the central Wazuh server. Wazuh displays the information on a pre-configured dashboard imported from this repository.
+### Common Parameters (all templates)
+
+| Parameter | Description | Default |
+|---|---|---|
+| `LatestAmiId` | SSM path for Amazon Linux 2 AMI | `/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs` |
+| `NameBurtualHubVPN` | SoftEther Virtual Hub name | — |
+| `EC2InstanceType` | Instance type | `t3a.medium` |
+| `IPsecPreSharedKey` | IPsec L2TP pre-shared key | — |
+| `DefaultVPNUser` | Default VPN username to create | — |
+| `DefaultVPNUserPassword` | Password for the default VPN user | — |
+| `SoftetherPassword` | SoftEther server admin password | — |
+| `VPCId` | VPC ID for deployment | — |
+
+### Additional Parameters by Template
+
+**`Sofether_internal.yml`** (SoftEther + Wazuh + EIP):
+- `SubnetIdPublicSoftether` — Public subnet for SoftEther
+- `SubnetIdPrivateWazuh` — Private subnet for Wazuh
+- `WazuhPassword` — Wazuh admin password
+
+**`Sofether_internal_no_wazuh.yml`** (SoftEther only):
+- `SubnetIdPublicSoftether` — Public subnet for SoftEther
+
+**`Sofether_external.yml`** (SoftEther + Wazuh + NLB):
+- `CertificateArn` — ACM certificate ARN for TLS termination
+- `SubnetIdPrivateSoftether` — Private subnet for SoftEther
+- `SubnetIdPrivateWazuh` — Private subnet for Wazuh
+- `SubnetIdPublicOne` — First public subnet for NLB
+- `SubnetIdPublicTwo` — Second public subnet for NLB
+- `WazuhPassword` — Wazuh admin password
 
 ## Infrastructure Resources
 
 The CloudFormation templates create the following AWS resources:
 
-- VPC (Virtual Private Cloud) — via `vpc.yml`
-- Private and Public Subnets
-- EC2 Instances
-- Security Groups
-- IAM Roles
+- VPC with public/private subnets and NAT Gateway (`vpc.yml`)
+- EC2 instances (SoftEther, and optionally Wazuh)
+- Security Groups (VPN ports 443/TCP, 500/UDP, 4500/UDP, 1701/UDP)
+- IAM Roles with SSM access for management
 - Network Interfaces
-- Elastic IPs (internal templates) or Network Load Balancer (external template)
-- Dedicated EBS volume for SoftEther VPN configuration persistence
+- Dedicated encrypted EBS volumes for config persistence
+- Elastic IP (internal templates) or Network Load Balancer (external template)
 
 ## Deployment
 
 ### Step 1: Deploy the VPC
 
-Upload the `vpc.yml` template. It defines the VPC and subnets needed for subsequent deployments. It includes two public and two private subnets.
+Deploy `vpc.yml`. It creates a VPC with 2 public subnets, 2 private subnets, a NAT Gateway, and routing tables.
 
-### Step 2: Choose a SoftEther Template
+**Important:** All SoftEther subnets must be in the **first AZ** (`!Select [0, !GetAZs '']`). Use the VPC stack outputs (`PublicSubnet1Id`, `PrivateSubnet1Id`) when selecting subnets for the SoftEther stack.
 
-Pick the template that matches your needs:
+### Step 2: Choose and Deploy a SoftEther Template
 
-#### Option A: SoftEther + Wazuh with Elastic IP
+#### Option A: SoftEther + Wazuh with Elastic IP (`Sofether_internal.yml`)
 
-Deploy `Sofether_internal.yml`. Required parameters:
+Best for: direct internet access without a load balancer.
 
-- Wazuh and SoftEther passwords
-- Private subnet ID (for Wazuh)
-- Public subnet ID (for SoftEther)
-- VPC ID
-- Hub name and IPsec pre-shared key
+Provide: VPC ID, public subnet (SoftEther), private subnet (Wazuh), passwords, hub name, PSK, and default VPN user credentials.
 
-Resources created: security group, network interfaces, Elastic IP, SoftEther EC2 instance, Wazuh EC2 instance, and a dedicated EBS volume for VPN config.
-
-The Wazuh URL and SoftEther Elastic IP are shown in the stack Outputs.
+Outputs: Wazuh URL, SoftEther Elastic IP.
 
 ![SoftEther + Wazuh architecture](Softether+Wazuh.png)
 
-#### Option B: SoftEther Only (No Wazuh)
+#### Option B: SoftEther Only (`Sofether_internal_no_wazuh.yml`)
 
-Deploy `Sofether_internal_no_wazuh.yml`. Required parameters:
+Best for: VPN-only deployments without monitoring.
 
-- SoftEther password
-- Public subnet ID
-- VPC ID
-- Hub name and IPsec pre-shared key
+Provide: VPC ID, public subnet, passwords, hub name, PSK, and default VPN user credentials.
 
-Same as Option A but without any Wazuh components. Only the SoftEther Elastic IP is shown in Outputs.
+Outputs: SoftEther Elastic IP.
 
-#### Option C: SoftEther + Wazuh behind NLB with TLS
+#### Option C: SoftEther + Wazuh behind NLB (`Sofether_external.yml`)
 
-**Requires a domain name and an ACM certificate.**
+Best for: production deployments with TLS termination and a custom domain.
 
-Deploy `Sofether_external.yml`. Required parameters:
+**Requires:** A domain name and an ACM certificate.
 
-- ACM certificate ARN
-- Wazuh and SoftEther passwords
-- Private subnet IDs (for SoftEther and Wazuh)
-- Two public subnet IDs (for the NLB)
-- VPC ID
-- Hub name and IPsec pre-shared key
+Provide: ACM certificate ARN, VPC ID, private subnets (SoftEther + Wazuh), two public subnets (NLB), passwords, hub name, PSK, and default VPN user credentials.
 
-Additional resources: Network Load Balancer with TLS termination on port 443 and UDP listeners for ports 500, 4500, and 1701.
+Additional resources: Network Load Balancer with TLS on port 443, UDP listeners for 500, 4500, 1701.
 
-Add the NLB DNS name as a CNAME record on your domain to use SSL.
+Add the NLB DNS name as a CNAME on your domain.
+
+Outputs: Wazuh URL.
 
 ![SoftEther + Wazuh + NLB architecture](Softether+Wazuh+NLB.png)
 
-### Step 3: Connect to SoftEther VPN Server
+### Step 3: Connect to SoftEther VPN
 
-Open the SoftEther VPN Server Manager. Connect using the Elastic IP (Options A/B) or the NLB domain (Option C) shown in the CloudFormation stack Outputs.
+Use the **SoftEther VPN Client** or any L2TP/IPsec client. Connect using:
+- Server: Elastic IP (Options A/B) or domain name (Option C)
+- Hub: the hub name you specified
+- User: the default VPN user credentials from the stack parameters
+- IPsec PSK: the pre-shared key you specified
 
-### Step 4: Create VPN Users and Connect via Client
+You can also use the **SoftEther VPN Server Manager** to manage hubs, users, and settings.
 
-Create user accounts in the SoftEther VPN Server Manager. Then use the SoftEther VPN Client Manager to connect with the new credentials. Once connected, you can access the Wazuh web interface (if deployed).
+### Step 4: Access Wazuh (templates with Wazuh)
 
-### Step 5: Log in to Wazuh
+Once connected to the VPN, access the Wazuh interface at the URL shown in the stack Outputs. Log in with user `admin` and the Wazuh password from stack parameters.
 
-Access the Wazuh interface and log in with user `admin` and the password you set during stack creation.
+The **SoftEther VPN Dashboard** is automatically imported and available under **Dashboards** in the Wazuh UI.
 
-### Step 6: Active Response Configuration on Wazuh EC2
+### Step 5: Active Response Configuration (Optional)
 
-To configure active response on the Wazuh instance:
+To enable active response (automatic IP blocking) on the Wazuh instance:
 
-1. **Connect to the Wazuh EC2 instance** via AWS Session Manager.
-2. **Gain superuser privileges**: `sudo su`
-3. **Edit** `/var/ossec/etc/ossec.conf` and add the following in the `<active-response>` section:
+1. Connect via AWS Session Manager: `sudo su`
+2. Edit `/var/ossec/etc/ossec.conf` and add:
     ```xml
     <ossec_config>
       <active-response>
@@ -127,21 +155,43 @@ To configure active response on the Wazuh instance:
       </active-response>
     </ossec_config>
     ```
-4. **Restart Wazuh Manager**: `sudo systemctl restart wazuh-manager`
-
-### Step 7: Import Dashboard Visualizations
-
-From the Wazuh top-right menu, go to **Dashboards Management > Saved Objects** and import `Visualizations.ndjson`. This file contains pre-configured graphs for the Explore-Dashboard section.
+3. Restart: `sudo systemctl restart wazuh-manager`
 
 ## EBS Config Volume
 
-The dedicated EBS volume ensures VPN configuration survives instance replacement (e.g. AMI updates). The flow:
+The dedicated EBS volume ensures VPN configuration survives instance replacement:
 
-1. On first boot, the volume is formatted and the VPN is configured from parameters.
-2. The config is backed up to `/mnt/vpnconfig/vpn_server.config`.
-3. The systemd service syncs the config to the EBS on every start and stop.
-4. On subsequent boots (new AMI, instance replacement), the existing config is detected and restored — the vpncmd setup is skipped entirely.
+1. **First boot:** volume is formatted, VPN is configured from parameters, default user is created, config is backed up.
+2. **Systemd service:** syncs config to EBS on every start/stop (`ExecStartPost` / `ExecStopPre` with `-` prefix to tolerate failures).
+3. **Subsequent boots:** existing config is detected and restored — VPN setup commands are skipped entirely.
 
-## Conclusion
+The volume uses `DeletionPolicy: Retain` so it survives stack deletes.
 
-This project provides a reproducible way to deploy SoftEther VPN (with or without Wazuh) on AWS using CloudFormation. The integration of a dedicated EBS volume for VPN configuration ensures consistency across AMI updates and instance replacements. SoftEther VPN secures access to the Wazuh monitoring platform, and the IaC approach enables automated, scalable, and cost-effective deployments.
+## Visualizations and Dashboard
+
+The `Visualizations.ndjson` file contains pre-configured Wazuh saved objects:
+
+| Object | Type | Description |
+|---|---|---|
+| OS System | Pie chart | Operating systems connecting to the VPN |
+| Country | Pie chart | Countries of connecting clients |
+| City | Pie chart | Cities of connecting clients |
+| VPN Map | Tile map | Geographic map of VPN connection attempts |
+| Table of IPs found in AlienVault | Table | IPs flagged in the AlienVault reputation database |
+| User authentication successful table | Table | Successful VPN logins with IP, user, country, city, and time |
+| SoftEther VPN Dashboard | Dashboard | Combines all visualizations above |
+
+These are automatically imported during deployment. To manually re-import: **Dashboards Management → Saved Objects → Import** and select `Visualizations.ndjson`.
+
+## Files
+
+```
+├── vpc.yml                         # VPC infrastructure
+├── Sofether_internal.yml           # SoftEther + Wazuh + Elastic IP
+├── Sofether_internal_no_wazuh.yml  # SoftEther only + Elastic IP
+├── Sofether_external.yml           # SoftEther + Wazuh + NLB
+├── Visualizations.ndjson           # Wazuh dashboard and visualizations
+├── Softether+Wazuh.png             # Architecture diagram (internal)
+├── Softether+Wazuh+NLB.png         # Architecture diagram (external/NLB)
+└── README.md
+```
