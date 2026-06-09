@@ -234,7 +234,7 @@ Resources:
           cat > /usr/local/bin/softether-traffic-monitor.sh << 'MONEOF'
           #!/bin/bash
           VPNCMD=/usr/local/vpnserver/vpncmd
-          HUB_NAME=$(grep -oP 'declare HubList.*?{.*?string Name (.*?)$' /usr/local/vpnserver/vpn_server.config 2>/dev/null | head -1 | awk '{print $NF}' || echo "VPN")
+          HUB_NAME="${NameBurtualHubVPN}"
           PASSWORD_FILE=/usr/local/vpnserver/.server_password
           LOG_FILE=/var/log/softether-traffic.log
           BASELINE_DIR=/var/lib/softether-monitor
@@ -244,15 +244,15 @@ Resources:
           else
             SVR_PASS=""
           fi
-          SESSIONS=$($VPNCMD localhost /SERVER /PASSWORD:"$SVR_PASS" /HUB:"$HUB_NAME" /CMD SessionList 2>/dev/null | grep -E "^SID-" | awk '{print $1}')
+          SESSIONS=$($VPNCMD localhost /SERVER /PASSWORD:"$SVR_PASS" /HUB:"$HUB_NAME" /CMD SessionList 2>/dev/null | grep -oP 'SID-[^\s|]+' | grep -v SECURENAT)
           for SESSION in $SESSIONS; do
             INFO=$($VPNCMD localhost /SERVER /PASSWORD:"$SVR_PASS" /HUB:"$HUB_NAME" /CMD SessionGet "$SESSION" 2>/dev/null)
             USERNAME=$(echo "$INFO" | grep "User Name" | head -1 | awk -F'|' '{print $2}' | xargs)
             SRC_IP=$(echo "$INFO" | grep "Client IP Address" | head -1 | awk -F'|' '{print $2}' | xargs)
-            TX_BYTES=$(echo "$INFO" | grep "Outgoing Data Size" | head -1 | awk -F'|' '{print $2}' | grep -oP '\d+')
-            RX_BYTES=$(echo "$INFO" | grep "Incoming Data Size" | head -1 | awk -F'|' '{print $2}' | grep -oP '\d+')
-            TX_PACKETS=$(echo "$INFO" | grep "Outgoing Unicast Packets" | head -1 | awk -F'|' '{print $2}' | grep -oP '\d+')
-            RX_PACKETS=$(echo "$INFO" | grep "Incoming Unicast Packets" | head -1 | awk -F'|' '{print $2}' | grep -oP '\d+')
+            TX_BYTES=$(echo "$INFO" | grep "Outgoing Data Size" | head -1 | awk -F'|' '{print $2}' | tr -d ',' | grep -oP '\d+')
+            RX_BYTES=$(echo "$INFO" | grep "Incoming Data Size" | head -1 | awk -F'|' '{print $2}' | tr -d ',' | grep -oP '\d+')
+            TX_PACKETS=$(echo "$INFO" | grep "Outgoing Unicast Packets" | head -1 | awk -F'|' '{print $2}' | tr -d ',' | grep -oP '\d+')
+            RX_PACKETS=$(echo "$INFO" | grep "Incoming Unicast Packets" | head -1 | awk -F'|' '{print $2}' | tr -d ',' | grep -oP '\d+')
             CONN_TIME=$(echo "$INFO" | grep "Connection Started at" | head -1 | awk -F'|' '{print $2}' | xargs)
             [ -z "$USERNAME" ] && continue
             [ -z "$TX_BYTES" ] && TX_BYTES=0
@@ -271,16 +271,17 @@ Resources:
             DELTA_RX=$((RX_BYTES - PREV_RX))
             [ "$DELTA_TX" -lt 0 ] && DELTA_TX=$TX_BYTES
             [ "$DELTA_RX" -lt 0 ] && DELTA_RX=$RX_BYTES
-            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-            echo "$TIMESTAMP softether-traffic: session=$SESSION user=$USERNAME srcip=$SRC_IP tx_bytes=$TX_BYTES rx_bytes=$RX_BYTES delta_tx=$DELTA_TX delta_rx=$DELTA_RX tx_packets=$TX_PACKETS rx_packets=$RX_PACKETS connected_since=\"$CONN_TIME\"" >> "$LOG_FILE"
+            TIMESTAMP=$(date '+%b %d %H:%M:%S')
+            HOSTNAME=$(hostname)
+            echo "$TIMESTAMP $HOSTNAME softether-traffic: session=$SESSION user=$USERNAME srcip=$SRC_IP tx_bytes=$TX_BYTES rx_bytes=$RX_BYTES delta_tx=$DELTA_TX delta_rx=$DELTA_RX tx_packets=$TX_PACKETS rx_packets=$RX_PACKETS connected_since=\"$CONN_TIME\"" >> "$LOG_FILE"
             THRESHOLD=104857600
             if [ "$DELTA_TX" -gt "$THRESHOLD" ] || [ "$DELTA_RX" -gt "$THRESHOLD" ]; then
-              echo "$TIMESTAMP softether-traffic-alert: HIGH_TRAFFIC session=$SESSION user=$USERNAME srcip=$SRC_IP delta_tx=$DELTA_TX delta_rx=$DELTA_RX" >> "$LOG_FILE"
+              echo "$TIMESTAMP $HOSTNAME softether-traffic-alert: HIGH_TRAFFIC session=$SESSION user=$USERNAME srcip=$SRC_IP delta_tx=$DELTA_TX delta_rx=$DELTA_RX" >> "$LOG_FILE"
             fi
             if [ "$TX_PACKETS" -gt 0 ] && [ "$RX_PACKETS" -gt 0 ]; then
               RATIO=$((TX_PACKETS / RX_PACKETS))
               if [ "$RATIO" -gt 50 ]; then
-                echo "$TIMESTAMP softether-traffic-alert: UNUSUAL_PACKET_RATIO session=$SESSION user=$USERNAME srcip=$SRC_IP tx_packets=$TX_PACKETS rx_packets=$RX_PACKETS ratio=$RATIO" >> "$LOG_FILE"
+                echo "$TIMESTAMP $HOSTNAME softether-traffic-alert: UNUSUAL_PACKET_RATIO session=$SESSION user=$USERNAME srcip=$SRC_IP tx_packets=$TX_PACKETS rx_packets=$RX_PACKETS ratio=$RATIO" >> "$LOG_FILE"
               fi
             fi
           done
@@ -641,7 +642,7 @@ Resources:
             # Traffic monitoring decoder and rules
             cat << 'EOF' > /var/ossec/etc/decoders/softether_traffic.xml
           <decoder name="softether_traffic_decoder">
-              <prematch type="pcre2">softether-traffic:</prematch>
+              <program_name>^softether-traffic$</program_name>
           </decoder>
           <decoder name="softether_traffic_decoder_child">
               <parent>softether_traffic_decoder</parent>
@@ -649,7 +650,7 @@ Resources:
               <order>srcuser, srcip, tx_bytes, rx_bytes, delta_tx, delta_rx</order>
           </decoder>
           <decoder name="softether_traffic_alert_decoder">
-              <prematch type="pcre2">softether-traffic-alert:</prematch>
+              <program_name>^softether-traffic-alert$</program_name>
           </decoder>
           <decoder name="softether_traffic_alert_decoder_child">
               <parent>softether_traffic_alert_decoder</parent>
