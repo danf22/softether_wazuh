@@ -1,7 +1,79 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Deploy SoftEther VPN + Wazuh on Amazon EC2 (Internal with EIP or External with NLB)
 
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Deployment Configuration
+        Parameters:
+          - DeploymentMode
+          - EC2InstanceType
+          - LatestAmiId
+          - AvailabilityZone
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VPCId
+          - SubnetIdSoftether
+          - SubnetIdPrivateWazuh
+          - SubnetIdPublicOne
+          - SubnetIdPublicTwo
+          - CertificateArn
+      - Label:
+          default: SoftEther VPN Configuration
+        Parameters:
+          - NameBurtualHubVPN
+          - SoftetherPassword
+          - IPsecPreSharedKey
+          - DefaultVPNUser
+          - DefaultVPNUserPassword
+          - SoftetherDownloadUrl
+      - Label:
+          default: Wazuh Configuration
+        Parameters:
+          - WazuhPassword
+          - WazuhVersion
+    ParameterLabels:
+      DeploymentMode:
+        default: Deployment Mode (internal = EIP, external = NLB + TLS)
+      EC2InstanceType:
+        default: EC2 Instance Type
+      LatestAmiId:
+        default: AMI ID (Amazon Linux 2)
+      AvailabilityZone:
+        default: Availability Zone
+      VPCId:
+        default: VPC
+      SubnetIdSoftether:
+        default: SoftEther Subnet (public for internal, private for external)
+      SubnetIdPrivateWazuh:
+        default: Wazuh Subnet (private)
+      SubnetIdPublicOne:
+        default: NLB Public Subnet 1 (external mode only)
+      SubnetIdPublicTwo:
+        default: NLB Public Subnet 2 (external mode only)
+      CertificateArn:
+        default: ACM Certificate ARN (external mode only)
+      NameBurtualHubVPN:
+        default: Virtual Hub Name
+      SoftetherPassword:
+        default: SoftEther Admin Password
+      IPsecPreSharedKey:
+        default: IPsec Pre-Shared Key
+      DefaultVPNUser:
+        default: Default VPN Username
+      DefaultVPNUserPassword:
+        default: Default VPN User Password
+      SoftetherDownloadUrl:
+        default: SoftEther Download URL
+      WazuhPassword:
+        default: Wazuh Admin Password
+      WazuhVersion:
+        default: Wazuh Version
+
 Parameters:
+  # --- Deployment Configuration ---
   DeploymentMode:
     Type: String
     Description: >
@@ -11,63 +83,84 @@ Parameters:
       - internal
       - external
     Default: internal
-  CertificateArn:
+  EC2InstanceType:
     Type: String
-    Description: The ARN of the ACM certificate for TLS termination (required only for external mode)
-    Default: ''
+    Description: EC2 instance type for SoftEther and Wazuh instances.
+    Default: t3a.medium
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >
+      Availability Zone for deployment. Must match the AZ of the selected subnets.
+
+  # --- Network Configuration ---
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the instances will be deployed.
+  SubnetIdSoftether:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Subnet for SoftEther. Use a PUBLIC subnet for internal mode
+      or a PRIVATE subnet for external mode.
+  SubnetIdPrivateWazuh:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet for the Wazuh instance.
+  SubnetIdPublicOne:
+    Type: String
+    Description: First public subnet for NLB (external mode only). Leave empty for internal mode.
+    Default: ''
+  SubnetIdPublicTwo:
+    Type: String
+    Description: Second public subnet for NLB (external mode only). Leave empty for internal mode.
+    Default: ''
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for TLS termination (external mode only). Leave empty for internal mode.
+    Default: ''
+
+  # --- SoftEther VPN Configuration ---
   NameBurtualHubVPN:
     Type: String
-    Description: HUB Name Softether VPN.
-  EC2InstanceType:
+    Description: Name for the SoftEther Virtual Hub.
+  SoftetherPassword:
+    Description: >
+      SoftEther admin password. 8-64 characters with at least one uppercase,
+      one lowercase, one number, and one of: .*+?-
     Type: String
-    Description: EC2 instance type for the Softether VPN.
-    Default: t3a.medium
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
+  IPsecPreSharedKey:
+    Type: String
+    NoEcho: true
+    Description: IPsec L2TP pre-shared key for VPN connections.
+  DefaultVPNUser:
+    Type: String
+    Description: Default VPN username to create on first deployment.
+  DefaultVPNUserPassword:
+    Description: >
+      Password for the default VPN user. 8-64 characters with at least one uppercase,
+      one lowercase, one number, and one of: .*+?-
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
   SoftetherDownloadUrl:
     Type: String
     Description: >
       Full download URL for the SoftEther VPN Server Linux x64 tarball.
       Find releases at https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases
     Default: 'https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz'
-  IPsecPreSharedKey:
-    Type: String
-    NoEcho: true
-    Description: Ipsec Pre-shared Key.
-  DefaultVPNUser:
-    Type: String
-    Description: Default VPN user name to create.
-  DefaultVPNUserPassword:
-    Description: "Password for the default VPN user. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
-    Type: String
-    NoEcho: true
-    MinLength: 8
-    MaxLength: 64
-    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
-  AvailabilityZone:
-    Type: AWS::EC2::AvailabilityZone::Name
+
+  # --- Wazuh Configuration ---
+  WazuhPassword:
     Description: >
-      Availability Zone for deployment. Must match the AZ of SubnetIdSoftether
-      and SubnetIdPrivateWazuh.
-  SubnetIdSoftether:
-    Type: AWS::EC2::Subnet::Id
-    Description: >
-      Subnet where SoftEther will be deployed.
-      Use a PUBLIC subnet for internal mode or a PRIVATE subnet for external mode.
-  SubnetIdPrivateWazuh:
-    Type: AWS::EC2::Subnet::Id
-    Description: Subnet where the Wazuh will be deployed (must be Private).
-  SubnetIdPublicOne:
-    Type: String
-    Description: First public subnet for NLB (required only for external mode). Leave empty for internal mode.
-    Default: ''
-  SubnetIdPublicTwo:
-    Type: String
-    Description: Second public subnet for NLB (required only for external mode). Leave empty for internal mode.
-    Default: ''
-  SoftetherPassword:
-    Description: "Password for Softether. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
+      Wazuh admin password. 8-64 characters with at least one uppercase,
+      one lowercase, one number, and one of: .*+?-
     Type: String
     NoEcho: true
     MinLength: 8
@@ -75,18 +168,8 @@ Parameters:
     AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
   WazuhVersion:
     Type: String
-    Description: Wazuh version to deploy (e.g. 4.14, 4.13, 4.12)
+    Description: Wazuh version to deploy (e.g. 4.14, 4.13, 4.12).
     Default: '4.14'
-  WazuhPassword:
-    Description: "Password for Wazuh. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
-    Type: String
-    NoEcho: true
-    MinLength: 8
-    MaxLength: 64
-    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
-  VPCId:
-    Type: AWS::EC2::VPC::Id
-    Description: VPC where the EC2 instance will be deployed
 
 Conditions:
   IsInternal: !Equals [!Ref DeploymentMode, 'internal']
