@@ -19,7 +19,8 @@ Metadata:
           - SubnetIdPrivateWazuh
           - SubnetIdPublicOne
           - SubnetIdPublicTwo
-          - CertificateArn
+          - DomainName
+          - HostedZoneId
       - Label:
           default: SoftEther VPN Configuration
         Parameters:
@@ -53,8 +54,10 @@ Metadata:
         default: NLB Public Subnet 1 (external mode only)
       SubnetIdPublicTwo:
         default: NLB Public Subnet 2 (external mode only)
-      CertificateArn:
-        default: ACM Certificate ARN (external mode only)
+      DomainName:
+        default: VPN Domain Name (external mode only)
+      HostedZoneId:
+        default: Route 53 Hosted Zone ID (external mode only)
       NameBurtualHubVPN:
         default: Virtual Hub Name
       SoftetherPassword:
@@ -115,9 +118,13 @@ Parameters:
     Type: String
     Description: Second public subnet for NLB (external mode only). Leave empty for internal mode.
     Default: ''
-  CertificateArn:
+  DomainName:
     Type: String
-    Description: ACM certificate ARN for TLS termination (external mode only). Leave empty for internal mode.
+    Description: Domain name for the VPN (external mode only, e.g. vpn.example.com). Leave empty for internal mode.
+    Default: ''
+  HostedZoneId:
+    Type: String
+    Description: Route 53 Hosted Zone ID for the domain (external mode only). Leave empty for internal mode.
     Default: ''
 
   # --- SoftEther VPN Configuration ---
@@ -425,134 +432,7 @@ Resources:
           sed -i '/<\/ossec_config>/i \ \ <localfile>\n\ \ \ <location>/usr/local/vpnserver/security_log/${NameBurtualHubVPN}/sec_20%y%m%d.log</location>\n\ \ \ <log_format>syslog</log_format>\n\ \ </localfile>' /var/ossec/etc/ossec.conf
           # Add traffic monitoring log to Wazuh agent
           sed -i '/<\/ossec_config>/i \ \ <localfile>\n\ \ \ <location>/var/log/softether-traffic.log</location>\n\ \ \ <log_format>syslog</log_format>\n\ \ </localfile>' /var/ossec/etc/ossec.conf
-          # Add Suricata eve.json log to Wazuh agent
-          sed -i '/<\/ossec_config>/i \ \ <localfile>\n\ \ \ <location>/var/log/suricata/eve.json</location>\n\ \ \ <log_format>json</log_format>\n\ \ </localfile>' /var/ossec/etc/ossec.conf
           
-          # ============================================================
-          # Install and configure Suricata IDS
-          # ============================================================
-          yum install -y epel-release
-          yum install -y suricata
-          
-          # Configure Suricata to monitor the VPN virtual interface (tap_softether)
-          # SoftEther creates a tap interface for the virtual hub traffic
-          cat > /etc/suricata/suricata-softether.yaml << 'SURIEOF'
-          %YAML 1.1
-          ---
-          vars:
-            address-groups:
-              HOME_NET: "[192.168.30.0/24,10.0.0.0/16]"
-              EXTERNAL_NET: "!$HOME_NET"
-              HTTP_SERVERS: "$HOME_NET"
-              DNS_SERVERS: "$HOME_NET"
-            port-groups:
-              HTTP_PORTS: "80"
-              SHELLCODE_PORTS: "!80"
-              SSH_PORTS: "22"
-          
-          default-log-dir: /var/log/suricata/
-          
-          outputs:
-            - eve-log:
-                enabled: yes
-                filetype: regular
-                filename: eve.json
-                types:
-                  - alert:
-                      payload: yes
-                      payload-printable: yes
-                      packet: yes
-                      metadata: yes
-                  - dns:
-                      enabled: yes
-                  - tls:
-                      enabled: yes
-                      extended: yes
-                  - http:
-                      enabled: yes
-                      extended: yes
-                  - files:
-                      enabled: yes
-                  - flow
-                  - anomaly:
-                      enabled: yes
-            - fast:
-                enabled: yes
-                filename: fast.log
-          
-          af-packet:
-            - interface: any
-              cluster-id: 99
-              cluster-type: cluster_flow
-              defrag: yes
-          
-          pcap:
-            - interface: any
-          
-          app-layer:
-            protocols:
-              tls:
-                enabled: yes
-                detection-ports:
-                  dp: 443
-              http:
-                enabled: yes
-              dns:
-                enabled: yes
-                tcp:
-                  enabled: yes
-                udp:
-                  enabled: yes
-              ssh:
-                enabled: yes
-              ftp:
-                enabled: yes
-              smtp:
-                enabled: yes
-          
-          detect:
-            profile: medium
-            sgh-mpm-context: auto
-          
-          default-rule-path: /var/lib/suricata/rules
-          rule-files:
-            - suricata.rules
-          SURIEOF
-          sed -i 's/^[[:space:]]*//' /etc/suricata/suricata-softether.yaml
-          
-          # Update Suricata rules (ET Open ruleset)
-          suricata-update
-          
-          # Create systemd override to use our custom config
-          mkdir -p /etc/systemd/system/suricata.service.d
-          cat > /etc/systemd/system/suricata.service.d/override.conf << 'SVCOVERRIDE'
-          [Service]
-          ExecStart=
-          ExecStart=/usr/sbin/suricata -c /etc/suricata/suricata-softether.yaml --af-packet -D
-          SVCOVERRIDE
-          sed -i 's/^[[:space:]]*//' /etc/systemd/system/suricata.service.d/override.conf
-          
-          # Create logrotate for Suricata
-          cat > /etc/logrotate.d/suricata << 'SURILR'
-          /var/log/suricata/*.log /var/log/suricata/*.json {
-              daily
-              rotate 14
-              compress
-              missingok
-              notifempty
-              sharedscripts
-              postrotate
-                  systemctl reload suricata 2>/dev/null || true
-              endscript
-          }
-          SURILR
-          
-          # Create daily rule update cron
-          echo "30 2 * * * root suricata-update && systemctl reload suricata" > /etc/cron.d/suricata-update
-          
-          systemctl daemon-reload
-          systemctl enable suricata
-          systemctl start suricata
           
           # Create traffic monitoring script
           cat > /usr/local/bin/softether-traffic-monitor.sh << 'MONEOF'
@@ -953,50 +833,8 @@ Resources:
           </group>
           EOF
             sed -i '268i\ \ \ \ <list>etc/lists/blacklist-alienvault</list>' /var/ossec/etc/ossec.conf
-            # Suricata-specific Wazuh rules for VPN IDS alerts
-            cat << 'EOF' > /var/ossec/etc/rules/suricata_vpn.xml
-          <group name="suricata_vpn,">
-            <!-- Suricata alert on VPN network - low severity -->
-            <rule id="100950" level="6">
-              <if_sid>86601</if_sid>
-              <field name="src_ip">192.168.30.</field>
-              <description>Suricata IDS alert from VPN client $(src_ip): $(alert.signature)</description>
-            </rule>
-            <!-- Suricata alert on VPN network - medium severity -->
-            <rule id="100951" level="10">
-              <if_sid>86601</if_sid>
-              <field name="src_ip">192.168.30.</field>
-              <field name="alert.severity">2</field>
-              <description>Suricata IDS MEDIUM severity alert from VPN client $(src_ip): $(alert.signature)</description>
-            </rule>
-            <!-- Suricata alert on VPN network - high severity -->
-            <rule id="100952" level="13">
-              <if_sid>86601</if_sid>
-              <field name="src_ip">192.168.30.</field>
-              <field name="alert.severity">1</field>
-              <description>Suricata IDS HIGH severity alert from VPN client $(src_ip): $(alert.signature)</description>
-            </rule>
-            <!-- Multiple Suricata alerts from same VPN client (possible compromise) -->
-            <rule id="100953" level="14" frequency="10" timeframe="300">
-              <if_matched_sid>100950</if_matched_sid>
-              <description>Suricata IDS: 10+ alerts from VPN client $(src_ip) in 5 minutes - possible compromised client</description>
-            </rule>
-            <!-- Suricata detected DNS query to known bad domain from VPN -->
-            <rule id="100954" level="12">
-              <if_sid>86611</if_sid>
-              <field name="src_ip">192.168.30.</field>
-              <list field="dns.query.rrname" lookup="match_key">etc/lists/blacklist-alienvault</list>
-              <description>Suricata DNS: VPN client $(src_ip) queried suspicious domain $(dns.query.rrname)</description>
-            </rule>
-            <!-- Suricata TLS connection to suspicious cert from VPN -->
-            <rule id="100955" level="8">
-              <if_sid>86612</if_sid>
-              <field name="src_ip">192.168.30.</field>
-              <field name="tls.subject">CN=*</field>
-              <description>Suricata TLS: VPN client $(src_ip) connected to $(tls.sni) with cert $(tls.subject)</description>
-            </rule>
-          </group>
-          EOF
+            # Configure active response to block IPs found in AlienVault list
+            sed -i '/<\/ossec_config>/i \ \ <command>\n\ \ \ \ <name>firewall-drop</name>\n\ \ \ \ <executable>firewall-drop</executable>\n\ \ \ \ <timeout_allowed>yes</timeout_allowed>\n\ \ </command>\n\ \ <active-response>\n\ \ \ \ <disabled>no</disabled>\n\ \ \ \ <command>firewall-drop</command>\n\ \ \ \ <location>local</location>\n\ \ \ \ <rules_id>100100,100305</rules_id>\n\ \ \ \ <timeout>3600</timeout>\n\ \ </active-response>' /var/ossec/etc/ossec.conf
             # Backup Wazuh config to EBS
             cp -a /var/ossec/etc/ossec.conf $WCONFIG_MNT/ossec.conf
             cp -a /var/ossec/etc/rules/ $WCONFIG_MNT/rules/
@@ -1013,13 +851,28 @@ Resources:
           
           systemctl restart wazuh-manager
           
+          # Wait for Wazuh Manager API to be fully ready
+          print_info() { echo "[INFO] $1"; }
+          print_info "Waiting for Wazuh Manager API to be ready..."
+          for i in $(seq 1 90); do
+            WAZUH_API_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" -u "wazuh-wui:wazuh-wui" "https://localhost:55000/?pretty=true" 2>/dev/null)
+            if [ "$WAZUH_API_STATUS" = "200" ]; then
+              print_info "Wazuh Manager API is ready."
+              break
+            fi
+            sleep 10
+          done
+          
           # Import Wazuh dashboard visualizations
-          # Wait for the dashboard to be ready
+          # Wait for the dashboard (OpenSearch Dashboards) to be ready
           for i in $(seq 1 60); do
-            curl -sk https://localhost:443 && break
+            DASH_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "https://localhost:443" 2>/dev/null)
+            if [ "$DASH_STATUS" = "200" ] || [ "$DASH_STATUS" = "302" ]; then
+              break
+            fi
             sleep 5
           done
-          sleep 10
+          sleep 15
           
           # Create the wazuh-alerts-* index pattern required by visualizations
           curl -sk -X POST "https://localhost:443/api/saved_objects/index-pattern/wazuh-alerts-*" \
@@ -1043,7 +896,32 @@ Resources:
           Value: Wazuh
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT10M
+        Timeout: PT20M
+
+  # ============================================================
+  # ACM Certificate and Route 53 (external mode only)
+  # ============================================================
+  ACMCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: IsExternal
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  DNSRecordNLB:
+    Type: AWS::Route53::RecordSet
+    Condition: IsExternal
+    DependsOn: NLB
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt NLB.DNSName
+        HostedZoneId: !GetAtt NLB.CanonicalHostedZoneID
 
   # ============================================================
   # Network Load Balancer (external mode only)
@@ -1095,7 +973,7 @@ Resources:
       Protocol: TLS
       SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
       Certificates:
-        - CertificateArn: !Ref CertificateArn
+        - CertificateArn: !Ref ACMCertificate
 
   # 500 UDP Target Group and Listener
   UDP500TargetGroup:
@@ -1198,6 +1076,11 @@ Outputs:
     Value: !Sub "${EIP.PublicIp}"
 
   NLBDnsName:
-    Description: NLB DNS name - add as CNAME to your domain (external mode)
+    Description: NLB DNS name (external mode)
     Condition: IsExternal
     Value: !GetAtt NLB.DNSName
+
+  VPNDomainName:
+    Description: VPN domain name (external mode)
+    Condition: IsExternal
+    Value: !Ref DomainName

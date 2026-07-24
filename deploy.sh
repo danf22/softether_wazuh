@@ -174,8 +174,9 @@ deploy_vpc() {
 # Deploy SoftEther internal (with Wazuh)
 deploy_internal() {
   local stack_name="softether-internal"
-  print_info "=== Deploying SoftEther + Wazuh (Internal with EIP) ==="
+  print_info "=== Deploying SoftEther + Wazuh + Suricata (Internal with EIP) ==="
 
+  prompt AZ "Availability Zone (must match subnet)" "us-east-1a"
   prompt HUB_NAME "VPN Hub name" "VPN"
   prompt_password SOFTETHER_PASSWORD "SoftEther password"
   prompt_password WAZUH_PASSWORD "Wazuh admin password"
@@ -186,11 +187,13 @@ deploy_internal() {
 
   aws cloudformation create-stack \
     --stack-name "$stack_name" \
-    --template-body "file://${SCRIPT_DIR}/Sofether_internal.yml" \
+    --template-body "file://${SCRIPT_DIR}/Softether_wazuh.yml" \
     --region "$REGION" \
     --capabilities CAPABILITY_NAMED_IAM \
     --tags Key=Project,Value=SoftEther-Wazuh \
     --parameters \
+      ParameterKey=DeploymentMode,ParameterValue="internal" \
+      ParameterKey=AvailabilityZone,ParameterValue="$AZ" \
       ParameterKey=NameBurtualHubVPN,ParameterValue="$HUB_NAME" \
       ParameterKey=SoftetherPassword,ParameterValue="$SOFTETHER_PASSWORD" \
       ParameterKey=WazuhPassword,ParameterValue="$WAZUH_PASSWORD" \
@@ -198,7 +201,7 @@ deploy_internal() {
       ParameterKey=DefaultVPNUser,ParameterValue="$DEFAULT_VPN_USER" \
       ParameterKey=DefaultVPNUserPassword,ParameterValue="$DEFAULT_VPN_USER_PASSWORD" \
       ParameterKey=EC2InstanceType,ParameterValue="$INSTANCE_TYPE" \
-      ParameterKey=SubnetIdPublicSoftether,ParameterValue="$PUBLIC_SUBNET_1" \
+      ParameterKey=SubnetIdSoftether,ParameterValue="$PUBLIC_SUBNET_1" \
       ParameterKey=SubnetIdPrivateWazuh,ParameterValue="$PRIVATE_SUBNET_1" \
       ParameterKey=VPCId,ParameterValue="$VPC_ID"
 
@@ -241,33 +244,38 @@ deploy_internal_no_wazuh() {
 # Deploy SoftEther external (with NLB)
 deploy_external() {
   local stack_name="softether-external"
-  print_info "=== Deploying SoftEther + Wazuh (External with NLB + TLS) ==="
+  print_info "=== Deploying SoftEther + Wazuh + Suricata (External with NLB + TLS) ==="
 
+  prompt AZ "Availability Zone (must match subnet)" "us-east-1a"
   prompt HUB_NAME "VPN Hub name" "VPN"
   prompt_password SOFTETHER_PASSWORD "SoftEther password"
   prompt_password WAZUH_PASSWORD "Wazuh admin password"
   prompt IPSEC_PSK "IPsec pre-shared key" "" true
   prompt DEFAULT_VPN_USER "Default VPN username"
   prompt_password DEFAULT_VPN_USER_PASSWORD "Default VPN user password"
-  prompt CERTIFICATE_ARN "ACM Certificate ARN"
+  prompt DOMAIN_NAME "VPN domain name (e.g. vpn.example.com)"
+  prompt HOSTED_ZONE_ID "Route 53 Hosted Zone ID"
   prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
 
   aws cloudformation create-stack \
     --stack-name "$stack_name" \
-    --template-body "file://${SCRIPT_DIR}/Sofether_external.yml" \
+    --template-body "file://${SCRIPT_DIR}/Softether_wazuh.yml" \
     --region "$REGION" \
     --capabilities CAPABILITY_NAMED_IAM \
     --tags Key=Project,Value=SoftEther-Wazuh \
     --parameters \
+      ParameterKey=DeploymentMode,ParameterValue="external" \
+      ParameterKey=AvailabilityZone,ParameterValue="$AZ" \
       ParameterKey=NameBurtualHubVPN,ParameterValue="$HUB_NAME" \
       ParameterKey=SoftetherPassword,ParameterValue="$SOFTETHER_PASSWORD" \
       ParameterKey=WazuhPassword,ParameterValue="$WAZUH_PASSWORD" \
       ParameterKey=IPsecPreSharedKey,ParameterValue="$IPSEC_PSK" \
       ParameterKey=DefaultVPNUser,ParameterValue="$DEFAULT_VPN_USER" \
       ParameterKey=DefaultVPNUserPassword,ParameterValue="$DEFAULT_VPN_USER_PASSWORD" \
-      ParameterKey=CertificateArn,ParameterValue="$CERTIFICATE_ARN" \
+      ParameterKey=DomainName,ParameterValue="$DOMAIN_NAME" \
+      ParameterKey=HostedZoneId,ParameterValue="$HOSTED_ZONE_ID" \
       ParameterKey=EC2InstanceType,ParameterValue="$INSTANCE_TYPE" \
-      ParameterKey=SubnetIdPrivateSoftether,ParameterValue="$PRIVATE_SUBNET_1" \
+      ParameterKey=SubnetIdSoftether,ParameterValue="$PRIVATE_SUBNET_1" \
       ParameterKey=SubnetIdPrivateWazuh,ParameterValue="$PRIVATE_SUBNET_2" \
       ParameterKey=SubnetIdPublicOne,ParameterValue="$PUBLIC_SUBNET_1" \
       ParameterKey=SubnetIdPublicTwo,ParameterValue="$PUBLIC_SUBNET_2" \

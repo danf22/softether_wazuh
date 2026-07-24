@@ -1,14 +1,12 @@
-# Deploy SoftEther VPN + Wazuh + Suricata IDS on AWS with CloudFormation
+# Deploy SoftEther VPN + Wazuh on AWS with CloudFormation
 
-This project deploys SoftEther VPN with Wazuh SIEM and Suricata IDS on Amazon Web Services using CloudFormation. It provides automated VPN provisioning with persistent configuration, intrusion detection on decrypted VPN traffic, malicious IP detection via AlienVault reputation lists, and pre-built monitoring dashboards — all through Infrastructure as Code.
 
 ## Templates
 
 | Template | Description |
 |---|---|
 | `vpc.yml` | VPC with 2 public and 2 private subnets, NAT Gateway, and routing |
-| `Softether_wazuh.yml` | SoftEther + Wazuh + Suricata (unified template with internal/external mode) |
-| `Sofether_internal_no_wazuh.yml` | SoftEther only (no Wazuh/Suricata) with a public Elastic IP |
+| `Softether_wazuh.yml` | SoftEther + Wazuh (unified template with internal/external mode) |
 
 ## Architecture
 
@@ -26,8 +24,6 @@ Both modes share these characteristics:
 - **Default VPN user** created during first deployment via parameters
 - **IP forwarding** persisted via `/etc/sysctl.d/99-ip-forward.conf`
 - **cfn-signal** for reliable CloudFormation creation feedback
-- **Suricata IDS** on SoftEther instance inspecting decrypted VPN traffic
-- **Wazuh agent** on SoftEther instance forwarding VPN security logs and Suricata alerts
 - **Automatic dashboard import** — visualizations and dashboards are imported into Wazuh during deployment
 
 ### Security Monitoring Stack
@@ -35,30 +31,16 @@ Both modes share these characteristics:
 | Component | Role |
 |---|---|
 | **SoftEther VPN** | VPN server with L2TP/IPsec |
-| **Suricata IDS** | Network intrusion detection on decrypted VPN traffic |
 | **Wazuh Manager** | SIEM: log collection, rule correlation, alerting |
-| **Wazuh Agent** | Forwards SoftEther logs, traffic stats, and Suricata eve.json to the manager |
 | **AlienVault OTX** | Threat intelligence IP reputation database |
-
-### Suricata IDS Features
-
-- Inspects decrypted VPN traffic (sees inside the tunnel)
-- ET Open ruleset with daily automatic updates via `suricata-update`
-- EVE JSON logging (alerts, DNS, TLS, HTTP, flows, anomalies)
-- Custom Wazuh rules for VPN-specific IDS alerts (severity-based escalation)
-- Detects: malware downloads, exploit attempts, port scanning, DNS tunneling, suspicious TLS certificates
 
 ### Wazuh Features
 
 - AlienVault IP reputation database integration
 - Custom decoders for SoftEther VPN log parsing
 - Custom rules for authentication events, brute-force detection, and malicious IP alerts
-- Traffic monitoring with high-bandwidth and unusual packet ratio detection
-- Suricata alert correlation with VPN session data
-- Three pre-configured dashboards:
+- Pre-configured dashboard:
   - **SoftEther VPN Dashboard** — OS, Country, City, VPN Map, AlienVault IPs, user auth table
-  - **SoftEther VPN Traffic Monitoring** — bandwidth alerts, unusual patterns, top users
-  - **Suricata IDS Dashboard** — alert severity, signatures, categories, DNS queries, TLS connections
 - Active response capability for blocking malicious IPs
 
 ## Parameters
@@ -83,7 +65,8 @@ Parameters are organized into groups in the CloudFormation console:
 | `SubnetIdPrivateWazuh` | Private subnet for Wazuh | — |
 | `SubnetIdPublicOne` | First public subnet for NLB (external only) | `''` |
 | `SubnetIdPublicTwo` | Second public subnet for NLB (external only) | `''` |
-| `CertificateArn` | ACM certificate ARN for TLS (external only) | `''` |
+| `DomainName` | VPN domain name, e.g. vpn.example.com (external only) | `''` |
+| `HostedZoneId` | Route 53 Hosted Zone ID for the domain (external only) | `''` |
 
 ### SoftEther VPN Configuration
 
@@ -108,7 +91,6 @@ Parameters are organized into groups in the CloudFormation console:
 The CloudFormation templates create the following AWS resources:
 
 - VPC with public/private subnets and NAT Gateway (`vpc.yml`)
-- EC2 instances (SoftEther with Suricata, and Wazuh)
 - Security Groups (VPN ports 443/TCP, 500/UDP, 4500/UDP, 1701/UDP)
 - IAM Roles with SSM access for management
 - Network Interfaces
@@ -123,7 +105,7 @@ Deploy `vpc.yml`. It creates a VPC with 2 public subnets, 2 private subnets, a N
 
 **Important:** All subnets used for SoftEther and Wazuh must be in the **same AZ** as the `AvailabilityZone` parameter you choose.
 
-### Step 2: Deploy SoftEther + Wazuh + Suricata
+### Step 2: Deploy SoftEther + Wazuh
 
 #### Option A: Internal Mode (Elastic IP)
 
@@ -144,22 +126,19 @@ Outputs: Wazuh URL, SoftEther Elastic IP.
 
 Best for: production deployments with TLS termination and a custom domain.
 
-**Requires:** A domain name and an ACM certificate.
+**Requires:** A Route 53 hosted zone with your domain. The stack automatically creates the ACM certificate (with DNS validation) and the DNS A-record alias pointing to the NLB.
 
 ```bash
 ./deploy.sh
 # Select option 3
 ```
 
-Provide: ACM certificate ARN, VPC ID, private subnets (SoftEther + Wazuh), two public subnets (NLB), AZ, passwords, hub name, PSK, and default VPN user credentials.
+Provide: VPC ID, private subnets (SoftEther + Wazuh), two public subnets (NLB), AZ, domain name, Route 53 hosted zone ID, passwords, hub name, PSK, and default VPN user credentials.
 
-Add the NLB DNS name as a CNAME on your domain.
-
-Outputs: Wazuh URL, NLB DNS name.
+Outputs: Wazuh URL, NLB DNS name, VPN domain name.
 
 ![SoftEther + Wazuh + NLB architecture](Softether+Wazuh+NLB.png)
 
-#### Option C: SoftEther Only (No Wazuh/Suricata)
 
 Best for: VPN-only deployments without monitoring.
 
@@ -184,10 +163,7 @@ You can also use the **SoftEther VPN Server Manager** to manage hubs, users, and
 
 Once connected to the VPN, access the Wazuh interface at the URL shown in the stack Outputs. Log in with user `admin` and the Wazuh password from stack parameters.
 
-Three dashboards are automatically imported and available under **Dashboards** in the Wazuh UI:
-- **SoftEther VPN Dashboard** — connection overview with geo maps
-- **SoftEther VPN Traffic Monitoring** — bandwidth and anomaly alerts
-- **Suricata IDS Dashboard** — intrusion detection alerts and network analysis
+The **SoftEther VPN Dashboard** is automatically imported and available under **Dashboards** in the Wazuh UI.
 
 ### Step 5: Active Response Configuration (Optional)
 
@@ -218,35 +194,6 @@ The dedicated EBS volume ensures VPN configuration survives instance replacement
 
 The volume uses `DeletionPolicy: Retain` so it survives stack deletes.
 
-## Suricata IDS
-
-Suricata is installed on the SoftEther instance to inspect **decrypted** VPN traffic. This gives visibility into what VPN users are actually doing on the network.
-
-### What it detects:
-- Malware downloads and C2 communication
-- Exploit attempts (CVE-based signatures)
-- Port scanning and reconnaissance
-- DNS tunneling and DGA domains
-- Suspicious TLS certificates
-- Protocol anomalies
-
-### Configuration:
-- Custom config at `/etc/suricata/suricata-softether.yaml`
-- HOME_NET: `192.168.30.0/24` (VPN DHCP range) + `10.0.0.0/16` (VPC)
-- Rules updated daily via cron (`suricata-update`)
-- EVE JSON output forwarded to Wazuh agent
-- Logs at `/var/log/suricata/eve.json`
-
-### Wazuh Rules for Suricata:
-| Rule ID | Level | Description |
-|---|---|---|
-| 100950 | 6 | Low-severity IDS alert from VPN client |
-| 100951 | 10 | Medium-severity IDS alert from VPN client |
-| 100952 | 13 | High-severity IDS alert from VPN client |
-| 100953 | 14 | 10+ alerts from same VPN client in 5 minutes |
-| 100954 | 12 | DNS query to suspicious domain from VPN client |
-| 100955 | 8 | TLS connection logging from VPN clients |
-
 ## Visualizations and Dashboards
 
 The `Visualizations.ndjson` file contains pre-configured Wazuh saved objects:
@@ -262,35 +209,13 @@ The `Visualizations.ndjson` file contains pre-configured Wazuh saved objects:
 | Table of IPs found in AlienVault | Table | IPs flagged in the AlienVault reputation database |
 | User authentication successful table | Table | Successful VPN logins with IP, user, country, city, and time |
 
-### SoftEther VPN Traffic Monitoring Dashboard
-
-| Object | Type | Description |
-|---|---|---|
-| Traffic Alerts by Rule | Pie chart | Distribution of traffic alert types |
-| Top Users by Traffic Alerts | Bar chart | Users generating the most traffic alerts |
-| High Traffic Alerts Over Time | Histogram | Timeline of high-bandwidth alerts |
-| Unusual Traffic Patterns | Histogram | Timeline of port scan / DDoS indicators |
-| VPN Traffic Monitor - User Sessions | Table | Session details with user, IP, and alert type |
-
-### Suricata IDS Dashboard
-
-| Object | Type | Description |
-|---|---|---|
-| Suricata Alerts by Severity | Pie chart | Distribution of alerts by Wazuh rule level |
-| Suricata Alert Categories | Pie chart | ET Open rule categories (Malware, Exploit, etc.) |
-| Suricata Alerts Over Time | Histogram | Timeline of IDS alerts by category |
-| Suricata Top Alert Signatures | Bar chart | Most triggered IDS signatures |
-| Suricata Top Source IPs | Table | Source IP, destination, port, and signature |
-| Suricata DNS Queries from VPN | Table | DNS queries by VPN clients |
-| Suricata TLS Connections | Table | TLS connections with SNI, version, and certificate |
-
 These are automatically imported during deployment. To manually re-import: **Dashboards Management → Saved Objects → Import** and select `Visualizations.ndjson`.
 
 ## Files
 
 ```
 ├── vpc.yml                         # VPC infrastructure
-├── Softether_wazuh.yml             # SoftEther + Wazuh + Suricata (unified, internal/external)
+├── Softether_wazuh.yml             # SoftEther + Wazuh (unified, internal/external)
 ├── Sofether_internal_no_wazuh.yml  # SoftEther only + Elastic IP
 ├── deploy.sh                       # Interactive deployment script
 ├── Visualizations.ndjson           # Wazuh dashboards and visualizations
@@ -303,5 +228,4 @@ These are automatically imported during deployment. To manually re-import: **Das
 
 | Version | Changes |
 |---|---|
-| v2.0 | Merged internal/external templates into unified `Softether_wazuh.yml` with deployment mode parameter. Added Suricata IDS integration. Added parameterized SoftEther and Wazuh versions. Added Suricata IDS Dashboard. Organized parameters with CloudFormation Interface metadata. |
 | v1.0 | Initial release with separate internal/external templates. SoftEther + Wazuh with AlienVault threat intel and traffic monitoring. |
