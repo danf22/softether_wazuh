@@ -366,6 +366,13 @@ destroy() {
 
   for stack in softether-internal softether-internal-no-wazuh softether-external; do
     if aws cloudformation describe-stacks --stack-name "$stack" --region "$REGION" &> /dev/null; then
+      # Empty the flow logs S3 bucket before deleting the stack
+      BUCKET_NAME=$(aws cloudformation describe-stacks --stack-name "$stack" --region "$REGION" \
+        --query "Stacks[0].Outputs[?OutputKey=='FlowLogsBucketName'].OutputValue" --output text 2>/dev/null)
+      if [ -n "$BUCKET_NAME" ] && [ "$BUCKET_NAME" != "None" ]; then
+        print_info "Emptying S3 bucket: $BUCKET_NAME"
+        aws s3 rm "s3://${BUCKET_NAME}" --recursive --region "$REGION" 2>/dev/null || true
+      fi
       print_info "Deleting stack: $stack"
       aws cloudformation delete-stack --stack-name "$stack" --region "$REGION"
       aws cloudformation wait stack-delete-complete --stack-name "$stack" --region "$REGION"
