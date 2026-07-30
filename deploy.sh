@@ -61,11 +61,10 @@ prompt() {
     exit 1
   fi
 
-  eval "$var_name='$value'"
+  printf -v "$var_name" '%s' "$value"
 }
 
 # Validate password meets CloudFormation pattern requirements
-# Must be 8-64 chars with at least one lowercase, one uppercase, one digit, and one of .*+?-
 validate_password() {
   local password="$1"
   local field_name="$2"
@@ -111,7 +110,32 @@ prompt_password() {
     print_warn "Please try again."
   done
 
-  eval "$var_name='$value'"
+  printf -v "$var_name" '%s' "$value"
+}
+
+# Prompt for Wazuh version from allowed list
+prompt_wazuh_version() {
+  echo ""
+  echo "  Available Wazuh versions:"
+  echo "    1) 4.14 (latest)"
+  echo "    2) 4.13"
+  echo "    3) 4.12"
+  echo "    4) 4.11"
+  echo "    5) 4.10"
+  echo "    6) 4.9"
+  echo ""
+  read -p "  Select Wazuh version [1]: " wv_choice
+  wv_choice="${wv_choice:-1}"
+  case "$wv_choice" in
+    1) WAZUH_VERSION="4.14" ;;
+    2) WAZUH_VERSION="4.13" ;;
+    3) WAZUH_VERSION="4.12" ;;
+    4) WAZUH_VERSION="4.11" ;;
+    5) WAZUH_VERSION="4.10" ;;
+    6) WAZUH_VERSION="4.9" ;;
+    *) WAZUH_VERSION="4.14" ;;
+  esac
+  print_info "Wazuh version: $WAZUH_VERSION"
 }
 
 # Wait for stack to complete
@@ -136,9 +160,32 @@ wait_for_stack() {
   fi
 }
 
+# Deploy or use existing VPC
+setup_vpc() {
+  echo ""
+  echo "  VPC Configuration:"
+  echo ""
+  echo "    1) Create a new VPC (using vpc.yml)"
+  echo "    2) Use an existing VPC"
+  echo ""
+  read -p "  Select [1]: " vpc_choice
+  vpc_choice="${vpc_choice:-1}"
+
+  if [ "$vpc_choice" = "2" ]; then
+    prompt VPC_ID "VPC ID (e.g. vpc-0abc123)"
+    prompt PUBLIC_SUBNET_1 "Public Subnet 1 ID (for SoftEther or NLB)"
+    prompt PUBLIC_SUBNET_2 "Public Subnet 2 ID (for NLB, or same as Subnet 1 if not using NLB)"
+    prompt PRIVATE_SUBNET_1 "Private Subnet 1 ID (for Wazuh or SoftEther in external mode)"
+    prompt PRIVATE_SUBNET_2 "Private Subnet 2 ID (optional, press enter to reuse Subnet 1)" "$PRIVATE_SUBNET_1"
+    print_info "Using existing VPC: $VPC_ID"
+  else
+    deploy_vpc
+  fi
+}
+
 # Deploy VPC stack
 deploy_vpc() {
-  print_info "=== Step 1: Deploying VPC ==="
+  print_info "=== Deploying VPC ==="
 
   if aws cloudformation describe-stacks --stack-name "$VPC_STACK_NAME" --region "$REGION" &> /dev/null; then
     print_warn "VPC stack '$VPC_STACK_NAME' already exists. Skipping VPC deployment."
@@ -171,19 +218,20 @@ deploy_vpc() {
   print_info "Private Subnet 2: $PRIVATE_SUBNET_2"
 }
 
-# Deploy SoftEther internal (with Wazuh)
+# Deploy SoftEther + Wazuh (internal mode)
 deploy_internal() {
   local stack_name="softether-internal"
-  print_info "=== Deploying SoftEther + Wazuh + Suricata (Internal with EIP) ==="
+  print_info "=== Deploying SoftEther + Wazuh (Internal with EIP) ==="
 
   prompt AZ "Availability Zone (must match subnet)" "us-east-1a"
   prompt HUB_NAME "VPN Hub name" "VPN"
-  prompt_password SOFTETHER_PASSWORD "SoftEther password"
+  prompt_password SOFTETHER_PASSWORD "SoftEther admin password"
   prompt_password WAZUH_PASSWORD "Wazuh admin password"
   prompt IPSEC_PSK "IPsec pre-shared key" "" true
   prompt DEFAULT_VPN_USER "Default VPN username"
   prompt_password DEFAULT_VPN_USER_PASSWORD "Default VPN user password"
   prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
+  prompt_wazuh_version
 
   aws cloudformation create-stack \
     --stack-name "$stack_name" \
@@ -197,6 +245,7 @@ deploy_internal() {
       ParameterKey=NameBurtualHubVPN,ParameterValue="$HUB_NAME" \
       ParameterKey=SoftetherPassword,ParameterValue="$SOFTETHER_PASSWORD" \
       ParameterKey=WazuhPassword,ParameterValue="$WAZUH_PASSWORD" \
+      ParameterKey=WazuhVersion,ParameterValue="$WAZUH_VERSION" \
       ParameterKey=IPsecPreSharedKey,ParameterValue="$IPSEC_PSK" \
       ParameterKey=DefaultVPNUser,ParameterValue="$DEFAULT_VPN_USER" \
       ParameterKey=DefaultVPNUserPassword,ParameterValue="$DEFAULT_VPN_USER_PASSWORD" \
@@ -209,13 +258,14 @@ deploy_internal() {
   print_outputs "$stack_name"
 }
 
-# Deploy SoftEther internal (no Wazuh)
+# Deploy SoftEther only (no Wazuh)
 deploy_internal_no_wazuh() {
   local stack_name="softether-internal-no-wazuh"
   print_info "=== Deploying SoftEther Only (Internal with EIP, No Wazuh) ==="
 
+  prompt AZ "Availability Zone (must match subnet)" "us-east-1a"
   prompt HUB_NAME "VPN Hub name" "VPN"
-  prompt_password SOFTETHER_PASSWORD "SoftEther password"
+  prompt_password SOFTETHER_PASSWORD "SoftEther admin password"
   prompt IPSEC_PSK "IPsec pre-shared key" "" true
   prompt DEFAULT_VPN_USER "Default VPN username"
   prompt_password DEFAULT_VPN_USER_PASSWORD "Default VPN user password"
@@ -241,14 +291,14 @@ deploy_internal_no_wazuh() {
   print_outputs "$stack_name"
 }
 
-# Deploy SoftEther external (with NLB)
+# Deploy SoftEther + Wazuh (external mode with NLB)
 deploy_external() {
   local stack_name="softether-external"
-  print_info "=== Deploying SoftEther + Wazuh + Suricata (External with NLB + TLS) ==="
+  print_info "=== Deploying SoftEther + Wazuh (External with NLB + TLS) ==="
 
   prompt AZ "Availability Zone (must match subnet)" "us-east-1a"
   prompt HUB_NAME "VPN Hub name" "VPN"
-  prompt_password SOFTETHER_PASSWORD "SoftEther password"
+  prompt_password SOFTETHER_PASSWORD "SoftEther admin password"
   prompt_password WAZUH_PASSWORD "Wazuh admin password"
   prompt IPSEC_PSK "IPsec pre-shared key" "" true
   prompt DEFAULT_VPN_USER "Default VPN username"
@@ -256,6 +306,7 @@ deploy_external() {
   prompt DOMAIN_NAME "VPN domain name (e.g. vpn.example.com)"
   prompt HOSTED_ZONE_ID "Route 53 Hosted Zone ID"
   prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
+  prompt_wazuh_version
 
   aws cloudformation create-stack \
     --stack-name "$stack_name" \
@@ -269,6 +320,7 @@ deploy_external() {
       ParameterKey=NameBurtualHubVPN,ParameterValue="$HUB_NAME" \
       ParameterKey=SoftetherPassword,ParameterValue="$SOFTETHER_PASSWORD" \
       ParameterKey=WazuhPassword,ParameterValue="$WAZUH_PASSWORD" \
+      ParameterKey=WazuhVersion,ParameterValue="$WAZUH_VERSION" \
       ParameterKey=IPsecPreSharedKey,ParameterValue="$IPSEC_PSK" \
       ParameterKey=DefaultVPNUser,ParameterValue="$DEFAULT_VPN_USER" \
       ParameterKey=DefaultVPNUserPassword,ParameterValue="$DEFAULT_VPN_USER_PASSWORD" \
@@ -334,21 +386,24 @@ destroy() {
 # Main menu
 main() {
   echo ""
-  echo "==========================================="
-  echo "  SoftEther VPN + Wazuh Deployment Tool"
-  echo "==========================================="
+  echo "╔═══════════════════════════════════════════════════════════╗"
+  echo "║       SoftEther VPN + Wazuh — AWS Deployment Tool        ║"
+  echo "╚═══════════════════════════════════════════════════════════╝"
   echo ""
-  echo "Select deployment option:"
+  echo "  Deployment options:"
   echo ""
-  echo "  1) SoftEther + Wazuh (Internal - Elastic IP)"
-  echo "  2) SoftEther Only (Internal - No Wazuh)"
-  echo "  3) SoftEther + Wazuh (External - NLB + TLS)"
-  echo "  4) Destroy all stacks"
-  echo "  5) Exit"
+  echo "    1) Internal — SoftEther + Wazuh (Elastic IP, direct access)"
+  echo "    2) Internal — SoftEther Only (Elastic IP, no monitoring)"
+  echo "    3) External — SoftEther + Wazuh (NLB + TLS + Route 53)"
+  echo ""
+  echo "  Management:"
+  echo ""
+  echo "    4) Destroy all stacks"
+  echo "    5) Exit"
   echo ""
   read -p "Option [1-5]: " choice
 
-  if [ "$choice" != "5" ]; then
+  if [ "$choice" != "4" ] && [ "$choice" != "5" ]; then
     prompt REGION "AWS Region" "us-east-1"
   fi
 
@@ -356,15 +411,15 @@ main() {
 
   case "$choice" in
     1)
-      deploy_vpc
+      setup_vpc
       deploy_internal
       ;;
     2)
-      deploy_vpc
+      setup_vpc
       deploy_internal_no_wazuh
       ;;
     3)
-      deploy_vpc
+      setup_vpc
       deploy_external
       ;;
     4)

@@ -175,8 +175,15 @@ Parameters:
     AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
   WazuhVersion:
     Type: String
-    Description: Wazuh version to deploy (e.g. 4.14, 4.13, 4.12).
+    Description: Wazuh version to deploy.
     Default: '4.14'
+    AllowedValues:
+      - '4.14'
+      - '4.13'
+      - '4.12'
+      - '4.11'
+      - '4.10'
+      - '4.9'
 
 Conditions:
   IsInternal: !Equals [!Ref DeploymentMode, 'internal']
@@ -199,6 +206,18 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-FlowLogsS3Read'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FlowLogsBucket.Arn
+                  - !Sub '${FlowLogsBucket.Arn}/*'
       Path: /
   SoftetherInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -206,6 +225,63 @@ Resources:
       InstanceProfileName: !Sub '${AWS::StackName}-SoftetherInstanceProfile'
       Roles:
         - !Ref SoftetherInstanceRole
+
+  # ============================================================
+  # VPC Flow Logs
+  # ============================================================
+  FlowLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-vpc-flowlogs-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FlowLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FlowLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSLogDeliveryWrite
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${FlowLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+          - Sid: AWSLogDeliveryCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:ListBucket
+            Resource: !GetAtt FlowLogsBucket.Arn
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    DependsOn: FlowLogsBucketPolicy
+    Properties:
+      ResourceId: !Ref VPCId
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !GetAtt FlowLogsBucket.Arn
+      MaxAggregationInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-FlowLog'
 
   # ============================================================
   # Security Groups
@@ -835,6 +911,8 @@ Resources:
             sed -i '268i\ \ \ \ <list>etc/lists/blacklist-alienvault</list>' /var/ossec/etc/ossec.conf
             # Configure active response to block IPs found in AlienVault list
             sed -i '/<\/ossec_config>/i \ \ <command>\n\ \ \ \ <name>firewall-drop</name>\n\ \ \ \ <executable>firewall-drop</executable>\n\ \ \ \ <timeout_allowed>yes</timeout_allowed>\n\ \ </command>\n\ \ <active-response>\n\ \ \ \ <disabled>no</disabled>\n\ \ \ \ <command>firewall-drop</command>\n\ \ \ \ <location>local</location>\n\ \ \ \ <rules_id>100100,100305</rules_id>\n\ \ \ \ <timeout>3600</timeout>\n\ \ </active-response>' /var/ossec/etc/ossec.conf
+            # Configure AWS VPC Flow Logs module
+            sed -i '/<\/ossec_config>/i \ \ <wodle name="aws-s3">\n\ \ \ \ <disabled>no</disabled>\n\ \ \ \ <interval>5m</interval>\n\ \ \ \ <run_on_start>yes</run_on_start>\n\ \ \ \ <bucket type="vpcflow">\n\ \ \ \ \ \ <name>${FlowLogsBucket}</name>\n\ \ \ \ \ \ <only_logs_after>2024-01-01</only_logs_after>\n\ \ \ \ </bucket>\n\ \ </wodle>' /var/ossec/etc/ossec.conf
             # Backup Wazuh config to EBS
             cp -a /var/ossec/etc/ossec.conf $WCONFIG_MNT/ossec.conf
             cp -a /var/ossec/etc/rules/ $WCONFIG_MNT/rules/
@@ -849,18 +927,28 @@ Resources:
             chown -R wazuh:wazuh /var/ossec/etc/rules/ /var/ossec/etc/decoders/ /var/ossec/etc/lists/
           fi
           
+          # Daily AlienVault reputation list update
+          cat > /usr/local/bin/update-alienvault.sh << 'AVEOF'
+          #!/bin/bash
+          wget -q https://iplists.firehol.org/files/alienvault_reputation.ipset -O /var/ossec/etc/lists/alienvault_reputation.ipset
+          /var/ossec/framework/python/bin/python3 /tmp/iplist-to-cdblist.py /var/ossec/etc/lists/alienvault_reputation.ipset /var/ossec/etc/lists/blacklist-alienvault
+          chown wazuh:wazuh /var/ossec/etc/lists/blacklist-alienvault
+          systemctl restart wazuh-manager
+          AVEOF
+          chmod +x /usr/local/bin/update-alienvault.sh
+          echo "0 3 * * * root /usr/local/bin/update-alienvault.sh" > /etc/cron.d/update-alienvault
+          
           systemctl restart wazuh-manager
           
           # Wait for Wazuh Manager API to be fully ready
           print_info() { echo "[INFO] $1"; }
           print_info "Waiting for Wazuh Manager API to be ready..."
-          for i in $(seq 1 90); do
-            WAZUH_API_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" -u "wazuh-wui:wazuh-wui" "https://localhost:55000/?pretty=true" 2>/dev/null)
-            if [ "$WAZUH_API_STATUS" = "200" ]; then
+          for i in $(seq 1 60); do
+            if curl -sk -o /dev/null -w "%{http_code}" "https://localhost:55000/" 2>/dev/null | grep -qE "^(200|401|308)$"; then
               print_info "Wazuh Manager API is ready."
               break
             fi
-            sleep 10
+            sleep 5
           done
           
           # Import Wazuh dashboard visualizations
@@ -1084,3 +1172,7 @@ Outputs:
     Description: VPN domain name (external mode)
     Condition: IsExternal
     Value: !Ref DomainName
+
+  FlowLogsBucketName:
+    Description: S3 bucket storing VPC Flow Logs (ingested by Wazuh)
+    Value: !Ref FlowLogsBucket

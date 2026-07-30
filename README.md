@@ -1,5 +1,6 @@
 # Deploy SoftEther VPN + Wazuh on AWS with CloudFormation
 
+This project deploys SoftEther VPN with Wazuh SIEM on Amazon Web Services using CloudFormation. It provides automated VPN provisioning with persistent configuration, malicious IP detection via AlienVault reputation lists, automatic IP blocking via active response, and a pre-built monitoring dashboard — all through Infrastructure as Code.
 
 ## Templates
 
@@ -7,6 +8,7 @@
 |---|---|
 | `vpc.yml` | VPC with 2 public and 2 private subnets, NAT Gateway, and routing |
 | `Softether_wazuh.yml` | SoftEther + Wazuh (unified template with internal/external mode) |
+| `Sofether_internal_no_wazuh.yml` | SoftEther only (no Wazuh) with a public Elastic IP |
 
 ## Architecture
 
@@ -24,14 +26,17 @@ Both modes share these characteristics:
 - **Default VPN user** created during first deployment via parameters
 - **IP forwarding** persisted via `/etc/sysctl.d/99-ip-forward.conf`
 - **cfn-signal** for reliable CloudFormation creation feedback
-- **Automatic dashboard import** — visualizations and dashboards are imported into Wazuh during deployment
+- **Wazuh agent** on SoftEther instance forwarding VPN security logs
+- **Automatic dashboard import** — visualizations imported into Wazuh during deployment
+- **Active response** — automatic IP blocking for AlienVault-flagged IPs
 
 ### Security Monitoring Stack
 
 | Component | Role |
 |---|---|
 | **SoftEther VPN** | VPN server with L2TP/IPsec |
-| **Wazuh Manager** | SIEM: log collection, rule correlation, alerting |
+| **Wazuh Manager** | SIEM: log collection, rule correlation, alerting, active response |
+| **Wazuh Agent** | Forwards SoftEther security logs to the manager |
 | **AlienVault OTX** | Threat intelligence IP reputation database |
 
 ### Wazuh Features
@@ -39,9 +44,20 @@ Both modes share these characteristics:
 - AlienVault IP reputation database integration
 - Custom decoders for SoftEther VPN log parsing
 - Custom rules for authentication events, brute-force detection, and malicious IP alerts
+- **Active response**: automatically blocks IPs found in AlienVault reputation list via `firewall-drop` (iptables)
 - Pre-configured dashboard:
   - **SoftEther VPN Dashboard** — OS, Country, City, VPN Map, AlienVault IPs, user auth table
-- Active response capability for blocking malicious IPs
+
+### Active Response
+
+When a VPN connection attempt comes from an IP found in the AlienVault reputation database, the system automatically:
+
+1. Wazuh Manager triggers rule `100100` or `100305`
+2. Active response executes `firewall-drop` on the SoftEther agent
+3. An iptables DROP rule is added for the offending IP
+4. The IP is automatically unblocked after 1 hour (configurable)
+
+This is enabled by default during deployment — no manual configuration needed.
 
 ## Parameters
 
@@ -91,11 +107,13 @@ Parameters are organized into groups in the CloudFormation console:
 The CloudFormation templates create the following AWS resources:
 
 - VPC with public/private subnets and NAT Gateway (`vpc.yml`)
+- EC2 instances (SoftEther and Wazuh)
 - Security Groups (VPN ports 443/TCP, 500/UDP, 4500/UDP, 1701/UDP)
 - IAM Roles with SSM access for management
 - Network Interfaces
 - Dedicated encrypted EBS volumes for config persistence
-- Elastic IP (internal mode) or Network Load Balancer (external mode)
+- Elastic IP (internal mode) or Network Load Balancer with ACM certificate (external mode)
+- Route 53 DNS record (external mode)
 
 ## Deployment
 
@@ -139,6 +157,7 @@ Outputs: Wazuh URL, NLB DNS name, VPN domain name.
 
 ![SoftEther + Wazuh + NLB architecture](Softether+Wazuh+NLB.png)
 
+#### Option C: SoftEther Only (No Wazuh)
 
 Best for: VPN-only deployments without monitoring.
 
@@ -165,24 +184,28 @@ Once connected to the VPN, access the Wazuh interface at the URL shown in the st
 
 The **SoftEther VPN Dashboard** is automatically imported and available under **Dashboards** in the Wazuh UI.
 
-### Step 5: Active Response Configuration (Optional)
+## Active Response Details
 
-To enable active response (automatic IP blocking) on the Wazuh instance:
+Active response is configured automatically during deployment. When an IP from the AlienVault reputation database attempts to connect to the VPN:
 
-1. Connect via AWS Session Manager: `sudo su`
-2. Edit `/var/ossec/etc/ossec.conf` and add:
-    ```xml
-    <ossec_config>
-      <active-response>
-        <disabled>no</disabled>
-        <command>netsh</command>
-        <location>local</location>
-        <rules_id>100100</rules_id>
-        <timeout>60</timeout>
-      </active-response>
-    </ossec_config>
-    ```
-3. Restart: `sudo systemctl restart wazuh-manager`
+- **Rules triggered**: `100100` (AlienVault IP in web/attack events) and `100305` (AlienVault IP attempting VPN login)
+- **Action**: `firewall-drop` — adds an iptables INPUT/DROP rule on the SoftEther instance
+- **Location**: `local` — executes on the agent where the event was detected
+- **Timeout**: 3600 seconds (1 hour) — IP is automatically unblocked after timeout
+
+To customize the timeout or add more rules, edit `/var/ossec/etc/ossec.conf` on the Wazuh manager:
+
+```xml
+<active-response>
+  <disabled>no</disabled>
+  <command>firewall-drop</command>
+  <location>local</location>
+  <rules_id>100100,100305</rules_id>
+  <timeout>3600</timeout>
+</active-response>
+```
+
+Set `<timeout>0</timeout>` for permanent blocks. Restart after changes: `sudo systemctl restart wazuh-manager`.
 
 ## EBS Config Volume
 
@@ -194,7 +217,7 @@ The dedicated EBS volume ensures VPN configuration survives instance replacement
 
 The volume uses `DeletionPolicy: Retain` so it survives stack deletes.
 
-## Visualizations and Dashboards
+## Visualizations and Dashboard
 
 The `Visualizations.ndjson` file contains pre-configured Wazuh saved objects:
 
@@ -211,6 +234,22 @@ The `Visualizations.ndjson` file contains pre-configured Wazuh saved objects:
 
 These are automatically imported during deployment. To manually re-import: **Dashboards Management → Saved Objects → Import** and select `Visualizations.ndjson`.
 
+## Custom Wazuh Rules
+
+| Rule ID | Level | Description |
+|---|---|---|
+| 100100 | 10 | IP found in AlienVault reputation database (triggers active response) |
+| 100302 | 0 | SoftEther authentication events (base rule, no alert) |
+| 100303 | 3 | Remote connection attempt to VPN |
+| 100304 | 5 | VPN user authentication failed |
+| 100305 | 10 | AlienVault IP attempting VPN login (triggers active response) |
+| 100306 | 10 | 10+ failed login attempts in 2 minutes (brute-force) |
+| 100307 | 10 | 10+ connection attempts from same IP in 2 minutes |
+| 100402 | 0 | SoftEther access events (base rule, no alert) |
+| 100404 | 3 | Successful VPN user authentication |
+| 100802 | 0 | SoftEther client details (base rule, no alert) |
+| 100804 | 3 | Client details: OS, hostname |
+
 ## Files
 
 ```
@@ -218,7 +257,7 @@ These are automatically imported during deployment. To manually re-import: **Das
 ├── Softether_wazuh.yml             # SoftEther + Wazuh (unified, internal/external)
 ├── Sofether_internal_no_wazuh.yml  # SoftEther only + Elastic IP
 ├── deploy.sh                       # Interactive deployment script
-├── Visualizations.ndjson           # Wazuh dashboards and visualizations
+├── Visualizations.ndjson           # Wazuh dashboard and visualizations
 ├── Softether+Wazuh.png             # Architecture diagram (internal)
 ├── Softether+Wazuh+NLB.png         # Architecture diagram (external/NLB)
 └── README.md
@@ -228,4 +267,5 @@ These are automatically imported during deployment. To manually re-import: **Das
 
 | Version | Changes |
 |---|---|
-| v1.0 | Initial release with separate internal/external templates. SoftEther + Wazuh with AlienVault threat intel and traffic monitoring. |
+| v2.0 | Merged internal/external templates into unified `Softether_wazuh.yml`. Added deployment mode parameter. Route 53 + ACM automation for external mode. Parameterized SoftEther and Wazuh versions. Active response for automatic IP blocking. Organized parameters with CloudFormation Interface metadata. |
+| v1.0 | Initial release with separate internal/external templates. SoftEther + Wazuh with AlienVault threat intel. |
