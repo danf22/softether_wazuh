@@ -912,7 +912,7 @@ Resources:
             # Configure active response to block IPs found in AlienVault list
             sed -i '/<\/ossec_config>/i \ \ <command>\n\ \ \ \ <name>firewall-drop</name>\n\ \ \ \ <executable>firewall-drop</executable>\n\ \ \ \ <timeout_allowed>yes</timeout_allowed>\n\ \ </command>\n\ \ <active-response>\n\ \ \ \ <disabled>no</disabled>\n\ \ \ \ <command>firewall-drop</command>\n\ \ \ \ <location>local</location>\n\ \ \ \ <rules_id>100100,100305</rules_id>\n\ \ \ \ <timeout>3600</timeout>\n\ \ </active-response>' /var/ossec/etc/ossec.conf
             # Configure AWS VPC Flow Logs module
-            sed -i '/<\/ossec_config>/i \ \ <wodle name="aws-s3">\n\ \ \ \ <disabled>no</disabled>\n\ \ \ \ <interval>5m</interval>\n\ \ \ \ <run_on_start>yes</run_on_start>\n\ \ \ \ <bucket type="vpcflow">\n\ \ \ \ \ \ <name>${FlowLogsBucket}</name>\n\ \ \ \ \ \ <only_logs_after>2024-01-01</only_logs_after>\n\ \ \ \ </bucket>\n\ \ </wodle>' /var/ossec/etc/ossec.conf
+            sed -i '/<\/ossec_config>/i \ \ <wodle name="aws-s3">\n\ \ \ \ <disabled>no</disabled>\n\ \ \ \ <interval>5m</interval>\n\ \ \ \ <run_on_start>yes</run_on_start>\n\ \ \ \ <bucket type="vpcflow">\n\ \ \ \ \ \ <name>${FlowLogsBucket}</name>\n\ \ \ \ \ \ <only_logs_after>2024-Jan-01</only_logs_after>\n\ \ \ \ </bucket>\n\ \ </wodle>' /var/ossec/etc/ossec.conf
             # Backup Wazuh config to EBS
             cp -a /var/ossec/etc/ossec.conf $WCONFIG_MNT/ossec.conf
             cp -a /var/ossec/etc/rules/ $WCONFIG_MNT/rules/
