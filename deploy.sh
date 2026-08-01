@@ -138,6 +138,27 @@ prompt_wazuh_version() {
   print_info "Wazuh version: $WAZUH_VERSION"
 }
 
+# Prompt for SoftEther version from allowed list
+prompt_softether_version() {
+  echo ""
+  echo "  Available SoftEther versions:"
+  echo "    1) v4.44-9807-rtm (latest, 2025.04.16)"
+  echo "    2) v4.42-9798-rtm (2023.06.30)"
+  echo "    3) v4.41-9787-rtm (2023.03.14)"
+  echo "    4) v4.38-9760-rtm (2021.08.17)"
+  echo ""
+  read -p "  Select SoftEther version [1]: " sv_choice
+  sv_choice="${sv_choice:-1}"
+  case "$sv_choice" in
+    1) SOFTETHER_URL="https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz" ;;
+    2) SOFTETHER_URL="https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.42-9798-rtm/softether-vpnserver-v4.42-9798-rtm-2023.06.30-linux-x64-64bit.tar.gz" ;;
+    3) SOFTETHER_URL="https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.41-9787-rtm/softether-vpnserver-v4.41-9787-rtm-2023.03.14-linux-x64-64bit.tar.gz" ;;
+    4) SOFTETHER_URL="https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.38-9760-rtm/softether-vpnserver-v4.38-9760-rtm-2021.08.17-linux-x64-64bit.tar.gz" ;;
+    *) SOFTETHER_URL="https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz" ;;
+  esac
+  print_info "SoftEther URL: $SOFTETHER_URL"
+}
+
 # Wait for stack to complete
 wait_for_stack() {
   local stack_name="$1"
@@ -181,9 +202,11 @@ setup_vpc() {
     prompt PUBLIC_SUBNET_2 "Public Subnet 2 ID (for NLB, or same as Subnet 1 if not using NLB)"
     prompt PRIVATE_SUBNET_1 "Private Subnet 1 ID (for Wazuh or SoftEther in external mode)"
     prompt PRIVATE_SUBNET_2 "Private Subnet 2 ID (optional, press enter to reuse Subnet 1)" "$PRIVATE_SUBNET_1"
+    prompt PRIVATE_NETWORK_CIDR "Private network CIDR to route through VPN (e.g. 172.16.1.0/24)" "10.0.3.0/24"
     print_info "Using existing VPC: $VPC_ID"
   else
     deploy_vpc
+    PRIVATE_NETWORK_CIDR="10.0.3.0/24"
   fi
 }
 
@@ -227,7 +250,14 @@ deploy_internal() {
   local stack_name="softether-internal"
   print_info "=== Deploying SoftEther + Wazuh (Internal with EIP) ==="
 
-  prompt AZ "Availability Zone (must match subnet)" "us-east-1a"
+  # Auto-detect AZs from subnets (ensures volumes match instances)
+  SOFTETHER_AZ=$(aws ec2 describe-subnets --subnet-ids "$PUBLIC_SUBNET_1" --region "$REGION" \
+    --query "Subnets[0].AvailabilityZone" --output text)
+  WAZUH_AZ=$(aws ec2 describe-subnets --subnet-ids "$PRIVATE_SUBNET_1" --region "$REGION" \
+    --query "Subnets[0].AvailabilityZone" --output text)
+  print_info "SoftEther AZ (from subnet): $SOFTETHER_AZ"
+  print_info "Wazuh AZ (from subnet): $WAZUH_AZ"
+
   prompt HUB_NAME "VPN Hub name" "VPN"
   prompt_password SOFTETHER_PASSWORD "SoftEther admin password"
   prompt_password WAZUH_PASSWORD "Wazuh admin password"
@@ -235,6 +265,7 @@ deploy_internal() {
   prompt DEFAULT_VPN_USER "Default VPN username"
   prompt_password DEFAULT_VPN_USER_PASSWORD "Default VPN user password"
   prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
+  prompt_softether_version
   prompt_wazuh_version
 
   # Write parameters to a temporary JSON file to avoid shell escaping issues
@@ -243,7 +274,8 @@ deploy_internal() {
   cat > "$params_file" << JSONEOF
 [
   {"ParameterKey": "DeploymentMode", "ParameterValue": "internal"},
-  {"ParameterKey": "AvailabilityZone", "ParameterValue": "${AZ}"},
+  {"ParameterKey": "SoftetherAvailabilityZone", "ParameterValue": "${SOFTETHER_AZ}"},
+  {"ParameterKey": "WazuhAvailabilityZone", "ParameterValue": "${WAZUH_AZ}"},
   {"ParameterKey": "NameBurtualHubVPN", "ParameterValue": "${HUB_NAME}"},
   {"ParameterKey": "SoftetherPassword", "ParameterValue": $(printf '%s' "$SOFTETHER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
   {"ParameterKey": "WazuhPassword", "ParameterValue": $(printf '%s' "$WAZUH_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
@@ -252,8 +284,10 @@ deploy_internal() {
   {"ParameterKey": "DefaultVPNUser", "ParameterValue": "${DEFAULT_VPN_USER}"},
   {"ParameterKey": "DefaultVPNUserPassword", "ParameterValue": $(printf '%s' "$DEFAULT_VPN_USER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
   {"ParameterKey": "EC2InstanceType", "ParameterValue": "${INSTANCE_TYPE}"},
+  {"ParameterKey": "SoftetherDownloadUrl", "ParameterValue": "${SOFTETHER_URL}"},
   {"ParameterKey": "SubnetIdSoftether", "ParameterValue": "${PUBLIC_SUBNET_1}"},
   {"ParameterKey": "SubnetIdPrivateWazuh", "ParameterValue": "${PRIVATE_SUBNET_1}"},
+  {"ParameterKey": "PrivateNetworkCIDR", "ParameterValue": "${PRIVATE_NETWORK_CIDR}"},
   {"ParameterKey": "VPCId", "ParameterValue": "${VPC_ID}"}
 ]
 JSONEOF
@@ -271,54 +305,17 @@ JSONEOF
   print_outputs "$stack_name"
 }
 
-# Deploy SoftEther only (no Wazuh)
-deploy_internal_no_wazuh() {
-  local stack_name="softether-internal-no-wazuh"
-  print_info "=== Deploying SoftEther Only (Internal with EIP, No Wazuh) ==="
-
-  prompt AZ "Availability Zone (must match subnet)" "us-east-1a"
-  prompt HUB_NAME "VPN Hub name" "VPN"
-  prompt_password SOFTETHER_PASSWORD "SoftEther admin password"
-  prompt IPSEC_PSK "IPsec pre-shared key" "" true
-  prompt DEFAULT_VPN_USER "Default VPN username"
-  prompt_password DEFAULT_VPN_USER_PASSWORD "Default VPN user password"
-  prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
-
-  # Write parameters to a temporary JSON file to avoid shell escaping issues
-  local params_file
-  params_file=$(mktemp)
-  cat > "$params_file" << JSONEOF
-[
-  {"ParameterKey": "NameBurtualHubVPN", "ParameterValue": "${HUB_NAME}"},
-  {"ParameterKey": "SoftetherPassword", "ParameterValue": $(printf '%s' "$SOFTETHER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
-  {"ParameterKey": "IPsecPreSharedKey", "ParameterValue": $(printf '%s' "$IPSEC_PSK" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
-  {"ParameterKey": "DefaultVPNUser", "ParameterValue": "${DEFAULT_VPN_USER}"},
-  {"ParameterKey": "DefaultVPNUserPassword", "ParameterValue": $(printf '%s' "$DEFAULT_VPN_USER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
-  {"ParameterKey": "EC2InstanceType", "ParameterValue": "${INSTANCE_TYPE}"},
-  {"ParameterKey": "SubnetIdPublicSoftether", "ParameterValue": "${PUBLIC_SUBNET_1}"},
-  {"ParameterKey": "VPCId", "ParameterValue": "${VPC_ID}"}
-]
-JSONEOF
-
-  aws cloudformation create-stack \
-    --stack-name "$stack_name" \
-    --template-body "file://${SCRIPT_DIR}/Sofether_internal_no_wazuh.yml" \
-    --region "$REGION" \
-    --capabilities CAPABILITY_NAMED_IAM \
-    --tags Key=Project,Value=SoftEther-Wazuh \
-    --parameters "file://${params_file}"
-
-  rm -f "$params_file"
-  wait_for_stack "$stack_name" "create"
-  print_outputs "$stack_name"
-}
-
 # Deploy SoftEther + Wazuh (external mode with NLB)
 deploy_external() {
   local stack_name="softether-external"
   print_info "=== Deploying SoftEther + Wazuh (External with NLB + TLS) ==="
 
-  prompt AZ "Availability Zone (must match subnet)" "us-east-1a"
+  # Auto-detect AZs from subnets (ensures volumes match instances)
+  SOFTETHER_AZ=$(aws ec2 describe-subnets --subnet-ids "$PRIVATE_SUBNET_1" --region "$REGION" \
+    --query "Subnets[0].AvailabilityZone" --output text)
+  WAZUH_AZ="$SOFTETHER_AZ"
+  print_info "Availability Zone (from subnet): $SOFTETHER_AZ"
+
   prompt HUB_NAME "VPN Hub name" "VPN"
   prompt_password SOFTETHER_PASSWORD "SoftEther admin password"
   prompt_password WAZUH_PASSWORD "Wazuh admin password"
@@ -328,6 +325,7 @@ deploy_external() {
   prompt DOMAIN_NAME "VPN domain name (e.g. vpn.example.com)"
   prompt HOSTED_ZONE_ID "Route 53 Hosted Zone ID"
   prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
+  prompt_softether_version
   prompt_wazuh_version
 
   # Write parameters to a temporary JSON file to avoid shell escaping issues
@@ -336,7 +334,8 @@ deploy_external() {
   cat > "$params_file" << JSONEOF
 [
   {"ParameterKey": "DeploymentMode", "ParameterValue": "external"},
-  {"ParameterKey": "AvailabilityZone", "ParameterValue": "${AZ}"},
+  {"ParameterKey": "SoftetherAvailabilityZone", "ParameterValue": "${SOFTETHER_AZ}"},
+  {"ParameterKey": "WazuhAvailabilityZone", "ParameterValue": "${WAZUH_AZ}"},
   {"ParameterKey": "NameBurtualHubVPN", "ParameterValue": "${HUB_NAME}"},
   {"ParameterKey": "SoftetherPassword", "ParameterValue": $(printf '%s' "$SOFTETHER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
   {"ParameterKey": "WazuhPassword", "ParameterValue": $(printf '%s' "$WAZUH_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
@@ -347,8 +346,10 @@ deploy_external() {
   {"ParameterKey": "DomainName", "ParameterValue": "${DOMAIN_NAME}"},
   {"ParameterKey": "HostedZoneId", "ParameterValue": "${HOSTED_ZONE_ID}"},
   {"ParameterKey": "EC2InstanceType", "ParameterValue": "${INSTANCE_TYPE}"},
+  {"ParameterKey": "SoftetherDownloadUrl", "ParameterValue": "${SOFTETHER_URL}"},
   {"ParameterKey": "SubnetIdSoftether", "ParameterValue": "${PRIVATE_SUBNET_1}"},
   {"ParameterKey": "SubnetIdPrivateWazuh", "ParameterValue": "${PRIVATE_SUBNET_1}"},
+  {"ParameterKey": "PrivateNetworkCIDR", "ParameterValue": "${PRIVATE_NETWORK_CIDR}"},
   {"ParameterKey": "SubnetIdPublicOne", "ParameterValue": "${PUBLIC_SUBNET_1}"},
   {"ParameterKey": "SubnetIdPublicTwo", "ParameterValue": "${PUBLIC_SUBNET_2}"},
   {"ParameterKey": "VPCId", "ParameterValue": "${VPC_ID}"}
@@ -385,7 +386,6 @@ destroy() {
   print_warn "=== Destroying Stacks ==="
   echo "This will delete the following stacks (EBS config volumes are retained):"
   echo "  - softether-internal"
-  echo "  - softether-internal-no-wazuh"
   echo "  - softether-external"
   echo "  - softether-vpc"
   echo ""
@@ -395,7 +395,7 @@ destroy() {
     exit 0
   fi
 
-  for stack in softether-internal softether-internal-no-wazuh softether-external; do
+  for stack in softether-internal softether-external; do
     if aws cloudformation describe-stacks --stack-name "$stack" --region "$REGION" &> /dev/null; then
       # Empty the flow logs S3 bucket before deleting the stack
       BUCKET_NAME=$(aws cloudformation describe-stacks --stack-name "$stack" --region "$REGION" \
@@ -431,17 +431,16 @@ main() {
   echo "  Deployment options:"
   echo ""
   echo "    1) Internal — SoftEther + Wazuh (Elastic IP, direct access)"
-  echo "    2) Internal — SoftEther Only (Elastic IP, no monitoring)"
-  echo "    3) External — SoftEther + Wazuh (NLB + TLS + Route 53)"
+  echo "    2) External — SoftEther + Wazuh (NLB + TLS + Route 53)"
   echo ""
   echo "  Management:"
   echo ""
-  echo "    4) Destroy all stacks"
-  echo "    5) Exit"
+  echo "    3) Destroy all stacks"
+  echo "    4) Exit"
   echo ""
-  read -p "Option [1-5]: " choice
+  read -p "Option [1-4]: " choice
 
-  if [ "$choice" != "4" ] && [ "$choice" != "5" ]; then
+  if [ "$choice" != "3" ] && [ "$choice" != "4" ]; then
     prompt REGION "AWS Region" "us-east-1"
   fi
 
@@ -454,16 +453,12 @@ main() {
       ;;
     2)
       setup_vpc
-      deploy_internal_no_wazuh
-      ;;
-    3)
-      setup_vpc
       deploy_external
       ;;
-    4)
+    3)
       destroy
       ;;
-    5)
+    4)
       print_info "Bye."
       exit 0
       ;;

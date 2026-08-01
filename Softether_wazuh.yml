@@ -10,13 +10,15 @@ Metadata:
           - DeploymentMode
           - EC2InstanceType
           - LatestAmiId
-          - AvailabilityZone
+          - SoftetherAvailabilityZone
+          - WazuhAvailabilityZone
       - Label:
           default: Network Configuration
         Parameters:
           - VPCId
           - SubnetIdSoftether
           - SubnetIdPrivateWazuh
+          - PrivateNetworkCIDR
           - SubnetIdPublicOne
           - SubnetIdPublicTwo
           - DomainName
@@ -42,14 +44,18 @@ Metadata:
         default: EC2 Instance Type
       LatestAmiId:
         default: AMI ID (Amazon Linux 2)
-      AvailabilityZone:
-        default: Availability Zone
+      SoftetherAvailabilityZone:
+        default: SoftEther Availability Zone
+      WazuhAvailabilityZone:
+        default: Wazuh Availability Zone
       VPCId:
         default: VPC
       SubnetIdSoftether:
         default: SoftEther Subnet (public for internal, private for external)
       SubnetIdPrivateWazuh:
         default: Wazuh Subnet (private)
+      PrivateNetworkCIDR:
+        default: Private Network CIDR (pushed to VPN clients)
       SubnetIdPublicOne:
         default: NLB Public Subnet 1 (external mode only)
       SubnetIdPublicTwo:
@@ -93,10 +99,16 @@ Parameters:
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
-  AvailabilityZone:
+  SoftetherAvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Description: >
-      Availability Zone for deployment. Must match the AZ of the selected subnets.
+      Availability Zone for the SoftEther instance and its EBS config volume.
+      Must match the AZ of the SoftEther subnet.
+  WazuhAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >
+      Availability Zone for the Wazuh instance and its EBS config volume.
+      Must match the AZ of the Wazuh subnet.
 
   # --- Network Configuration ---
   VPCId:
@@ -110,6 +122,12 @@ Parameters:
   SubnetIdPrivateWazuh:
     Type: AWS::EC2::Subnet::Id
     Description: Private subnet for the Wazuh instance.
+  PrivateNetworkCIDR:
+    Type: String
+    Description: >
+      CIDR block of the private network to route through the VPN (pushed to VPN clients).
+      Must match the CIDR of the private subnet where Wazuh resides.
+    Default: '10.0.3.0/24'
   SubnetIdPublicOne:
     Type: String
     Description: First public subnet for NLB (external mode only). Leave empty for internal mode.
@@ -162,6 +180,11 @@ Parameters:
       Full download URL for the SoftEther VPN Server Linux x64 tarball.
       Find releases at https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases
     Default: 'https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz'
+    AllowedValues:
+      - 'https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz'
+      - 'https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.42-9798-rtm/softether-vpnserver-v4.42-9798-rtm-2023.06.30-linux-x64-64bit.tar.gz'
+      - 'https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.41-9787-rtm/softether-vpnserver-v4.41-9787-rtm-2023.03.14-linux-x64-64bit.tar.gz'
+      - 'https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.38-9760-rtm/softether-vpnserver-v4.38-9760-rtm-2021.08.17-linux-x64-64bit.tar.gz'
 
   # --- Wazuh Configuration ---
   WazuhPassword:
@@ -389,7 +412,7 @@ Resources:
     Type: AWS::EC2::Volume
     DeletionPolicy: Retain
     Properties:
-      AvailabilityZone: !Ref AvailabilityZone
+      AvailabilityZone: !Ref SoftetherAvailabilityZone
       Size: 5
       VolumeType: gp3
       Encrypted: true
@@ -603,7 +626,12 @@ Resources:
             /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB "${NameBurtualHubVPN}" /CMD IPsecEnable /L2TP:yes /L2TPRAW:yes /ETHERIP:yes /PSK:${IPsecPreSharedKey} /DEFAULTHUB:"${NameBurtualHubVPN}"         
             /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD SecureNatEnable
             sleep 5
-            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD DhcpSet /START:192.168.30.10 /END:192.168.30.200 /MASK:255.255.255.0 /EXPIRE:86400 /GW:192.168.30.1 /DNS:192.168.30.1 /DNS2:8.8.8.8 /DOMAIN:none /LOG:yes /PUSHROUTE:10.0.3.0/255.255.255.0/192.168.30.1
+            # Convert CIDR to network/netmask for PUSHROUTE
+            PRIV_CIDR="${PrivateNetworkCIDR}"
+            PRIV_NET=$(echo "$PRIV_CIDR" | cut -d'/' -f1)
+            PRIV_PREFIX=$(echo "$PRIV_CIDR" | cut -d'/' -f2)
+            PRIV_MASK=$(python3 -c "import ipaddress; print(ipaddress.IPv4Network('$PRIV_CIDR', strict=False).netmask)")
+            /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD DhcpSet /START:192.168.30.10 /END:192.168.30.200 /MASK:255.255.255.0 /EXPIRE:86400 /GW:192.168.30.1 /DNS:192.168.30.1 /DNS2:8.8.8.8 /DOMAIN:none /LOG:yes /PUSHROUTE:$PRIV_NET/$PRIV_MASK/192.168.30.1
             # Create default VPN user
             /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD UserCreate "${DefaultVPNUser}" /GROUP:none /REALNAME:none /NOTE:none
             /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD UserPasswordSet "${DefaultVPNUser}" /PASSWORD:"${DefaultVPNUserPassword}"
@@ -659,7 +687,7 @@ Resources:
     Type: AWS::EC2::Volume
     DeletionPolicy: Retain
     Properties:
-      AvailabilityZone: !Ref AvailabilityZone
+      AvailabilityZone: !Ref WazuhAvailabilityZone
       Size: 10
       VolumeType: gp3
       Encrypted: true
