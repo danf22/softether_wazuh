@@ -151,11 +151,15 @@ wait_for_stack() {
     print_info "Stack '$stack_name' $operation completed successfully."
   else
     print_error "Stack '$stack_name' $operation failed."
+    # Show stack status reason (useful for validation errors)
+    aws cloudformation describe-stacks --stack-name "$stack_name" --region "$REGION" \
+      --query "Stacks[0].StackStatusReason" --output text 2>/dev/null || true
+    # Show failed resource events
     aws cloudformation describe-stack-events \
       --stack-name "$stack_name" \
       --region "$REGION" \
-      --query "StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
-      --output table
+      --query "StackEvents[?ResourceStatus=='CREATE_FAILED' || ResourceStatus=='ROLLBACK_IN_PROGRESS'].[LogicalResourceId,ResourceStatusReason]" \
+      --output table 2>/dev/null || true
     exit 1
   fi
 }
@@ -233,27 +237,36 @@ deploy_internal() {
   prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
   prompt_wazuh_version
 
+  # Write parameters to a temporary JSON file to avoid shell escaping issues
+  local params_file
+  params_file=$(mktemp)
+  cat > "$params_file" << JSONEOF
+[
+  {"ParameterKey": "DeploymentMode", "ParameterValue": "internal"},
+  {"ParameterKey": "AvailabilityZone", "ParameterValue": "${AZ}"},
+  {"ParameterKey": "NameBurtualHubVPN", "ParameterValue": "${HUB_NAME}"},
+  {"ParameterKey": "SoftetherPassword", "ParameterValue": $(printf '%s' "$SOFTETHER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "WazuhPassword", "ParameterValue": $(printf '%s' "$WAZUH_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "WazuhVersion", "ParameterValue": "${WAZUH_VERSION}"},
+  {"ParameterKey": "IPsecPreSharedKey", "ParameterValue": $(printf '%s' "$IPSEC_PSK" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "DefaultVPNUser", "ParameterValue": "${DEFAULT_VPN_USER}"},
+  {"ParameterKey": "DefaultVPNUserPassword", "ParameterValue": $(printf '%s' "$DEFAULT_VPN_USER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "EC2InstanceType", "ParameterValue": "${INSTANCE_TYPE}"},
+  {"ParameterKey": "SubnetIdSoftether", "ParameterValue": "${PUBLIC_SUBNET_1}"},
+  {"ParameterKey": "SubnetIdPrivateWazuh", "ParameterValue": "${PRIVATE_SUBNET_1}"},
+  {"ParameterKey": "VPCId", "ParameterValue": "${VPC_ID}"}
+]
+JSONEOF
+
   aws cloudformation create-stack \
     --stack-name "$stack_name" \
     --template-body "file://${SCRIPT_DIR}/Softether_wazuh.yml" \
     --region "$REGION" \
     --capabilities CAPABILITY_NAMED_IAM \
     --tags Key=Project,Value=SoftEther-Wazuh \
-    --parameters \
-      ParameterKey=DeploymentMode,ParameterValue="internal" \
-      ParameterKey=AvailabilityZone,ParameterValue="$AZ" \
-      ParameterKey=NameBurtualHubVPN,ParameterValue="$HUB_NAME" \
-      ParameterKey=SoftetherPassword,ParameterValue="$SOFTETHER_PASSWORD" \
-      ParameterKey=WazuhPassword,ParameterValue="$WAZUH_PASSWORD" \
-      ParameterKey=WazuhVersion,ParameterValue="$WAZUH_VERSION" \
-      ParameterKey=IPsecPreSharedKey,ParameterValue="$IPSEC_PSK" \
-      ParameterKey=DefaultVPNUser,ParameterValue="$DEFAULT_VPN_USER" \
-      ParameterKey=DefaultVPNUserPassword,ParameterValue="$DEFAULT_VPN_USER_PASSWORD" \
-      ParameterKey=EC2InstanceType,ParameterValue="$INSTANCE_TYPE" \
-      ParameterKey=SubnetIdSoftether,ParameterValue="$PUBLIC_SUBNET_1" \
-      ParameterKey=SubnetIdPrivateWazuh,ParameterValue="$PRIVATE_SUBNET_1" \
-      ParameterKey=VPCId,ParameterValue="$VPC_ID"
+    --parameters "file://${params_file}"
 
+  rm -f "$params_file"
   wait_for_stack "$stack_name" "create"
   print_outputs "$stack_name"
 }
@@ -271,22 +284,31 @@ deploy_internal_no_wazuh() {
   prompt_password DEFAULT_VPN_USER_PASSWORD "Default VPN user password"
   prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
 
+  # Write parameters to a temporary JSON file to avoid shell escaping issues
+  local params_file
+  params_file=$(mktemp)
+  cat > "$params_file" << JSONEOF
+[
+  {"ParameterKey": "NameBurtualHubVPN", "ParameterValue": "${HUB_NAME}"},
+  {"ParameterKey": "SoftetherPassword", "ParameterValue": $(printf '%s' "$SOFTETHER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "IPsecPreSharedKey", "ParameterValue": $(printf '%s' "$IPSEC_PSK" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "DefaultVPNUser", "ParameterValue": "${DEFAULT_VPN_USER}"},
+  {"ParameterKey": "DefaultVPNUserPassword", "ParameterValue": $(printf '%s' "$DEFAULT_VPN_USER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "EC2InstanceType", "ParameterValue": "${INSTANCE_TYPE}"},
+  {"ParameterKey": "SubnetIdPublicSoftether", "ParameterValue": "${PUBLIC_SUBNET_1}"},
+  {"ParameterKey": "VPCId", "ParameterValue": "${VPC_ID}"}
+]
+JSONEOF
+
   aws cloudformation create-stack \
     --stack-name "$stack_name" \
     --template-body "file://${SCRIPT_DIR}/Sofether_internal_no_wazuh.yml" \
     --region "$REGION" \
     --capabilities CAPABILITY_NAMED_IAM \
     --tags Key=Project,Value=SoftEther-Wazuh \
-    --parameters \
-      ParameterKey=NameBurtualHubVPN,ParameterValue="$HUB_NAME" \
-      ParameterKey=SoftetherPassword,ParameterValue="$SOFTETHER_PASSWORD" \
-      ParameterKey=IPsecPreSharedKey,ParameterValue="$IPSEC_PSK" \
-      ParameterKey=DefaultVPNUser,ParameterValue="$DEFAULT_VPN_USER" \
-      ParameterKey=DefaultVPNUserPassword,ParameterValue="$DEFAULT_VPN_USER_PASSWORD" \
-      ParameterKey=EC2InstanceType,ParameterValue="$INSTANCE_TYPE" \
-      ParameterKey=SubnetIdPublicSoftether,ParameterValue="$PUBLIC_SUBNET_1" \
-      ParameterKey=VPCId,ParameterValue="$VPC_ID"
+    --parameters "file://${params_file}"
 
+  rm -f "$params_file"
   wait_for_stack "$stack_name" "create"
   print_outputs "$stack_name"
 }
@@ -308,31 +330,40 @@ deploy_external() {
   prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
   prompt_wazuh_version
 
+  # Write parameters to a temporary JSON file to avoid shell escaping issues
+  local params_file
+  params_file=$(mktemp)
+  cat > "$params_file" << JSONEOF
+[
+  {"ParameterKey": "DeploymentMode", "ParameterValue": "external"},
+  {"ParameterKey": "AvailabilityZone", "ParameterValue": "${AZ}"},
+  {"ParameterKey": "NameBurtualHubVPN", "ParameterValue": "${HUB_NAME}"},
+  {"ParameterKey": "SoftetherPassword", "ParameterValue": $(printf '%s' "$SOFTETHER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "WazuhPassword", "ParameterValue": $(printf '%s' "$WAZUH_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "WazuhVersion", "ParameterValue": "${WAZUH_VERSION}"},
+  {"ParameterKey": "IPsecPreSharedKey", "ParameterValue": $(printf '%s' "$IPSEC_PSK" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "DefaultVPNUser", "ParameterValue": "${DEFAULT_VPN_USER}"},
+  {"ParameterKey": "DefaultVPNUserPassword", "ParameterValue": $(printf '%s' "$DEFAULT_VPN_USER_PASSWORD" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')},
+  {"ParameterKey": "DomainName", "ParameterValue": "${DOMAIN_NAME}"},
+  {"ParameterKey": "HostedZoneId", "ParameterValue": "${HOSTED_ZONE_ID}"},
+  {"ParameterKey": "EC2InstanceType", "ParameterValue": "${INSTANCE_TYPE}"},
+  {"ParameterKey": "SubnetIdSoftether", "ParameterValue": "${PRIVATE_SUBNET_1}"},
+  {"ParameterKey": "SubnetIdPrivateWazuh", "ParameterValue": "${PRIVATE_SUBNET_1}"},
+  {"ParameterKey": "SubnetIdPublicOne", "ParameterValue": "${PUBLIC_SUBNET_1}"},
+  {"ParameterKey": "SubnetIdPublicTwo", "ParameterValue": "${PUBLIC_SUBNET_2}"},
+  {"ParameterKey": "VPCId", "ParameterValue": "${VPC_ID}"}
+]
+JSONEOF
+
   aws cloudformation create-stack \
     --stack-name "$stack_name" \
     --template-body "file://${SCRIPT_DIR}/Softether_wazuh.yml" \
     --region "$REGION" \
     --capabilities CAPABILITY_NAMED_IAM \
     --tags Key=Project,Value=SoftEther-Wazuh \
-    --parameters \
-      ParameterKey=DeploymentMode,ParameterValue="external" \
-      ParameterKey=AvailabilityZone,ParameterValue="$AZ" \
-      ParameterKey=NameBurtualHubVPN,ParameterValue="$HUB_NAME" \
-      ParameterKey=SoftetherPassword,ParameterValue="$SOFTETHER_PASSWORD" \
-      ParameterKey=WazuhPassword,ParameterValue="$WAZUH_PASSWORD" \
-      ParameterKey=WazuhVersion,ParameterValue="$WAZUH_VERSION" \
-      ParameterKey=IPsecPreSharedKey,ParameterValue="$IPSEC_PSK" \
-      ParameterKey=DefaultVPNUser,ParameterValue="$DEFAULT_VPN_USER" \
-      ParameterKey=DefaultVPNUserPassword,ParameterValue="$DEFAULT_VPN_USER_PASSWORD" \
-      ParameterKey=DomainName,ParameterValue="$DOMAIN_NAME" \
-      ParameterKey=HostedZoneId,ParameterValue="$HOSTED_ZONE_ID" \
-      ParameterKey=EC2InstanceType,ParameterValue="$INSTANCE_TYPE" \
-      ParameterKey=SubnetIdSoftether,ParameterValue="$PRIVATE_SUBNET_1" \
-      ParameterKey=SubnetIdPrivateWazuh,ParameterValue="$PRIVATE_SUBNET_2" \
-      ParameterKey=SubnetIdPublicOne,ParameterValue="$PUBLIC_SUBNET_1" \
-      ParameterKey=SubnetIdPublicTwo,ParameterValue="$PUBLIC_SUBNET_2" \
-      ParameterKey=VPCId,ParameterValue="$VPC_ID"
+    --parameters "file://${params_file}"
 
+  rm -f "$params_file"
   wait_for_stack "$stack_name" "create"
   print_outputs "$stack_name"
 }
@@ -369,9 +400,9 @@ destroy() {
       # Empty the flow logs S3 bucket before deleting the stack
       BUCKET_NAME=$(aws cloudformation describe-stacks --stack-name "$stack" --region "$REGION" \
         --query "Stacks[0].Outputs[?OutputKey=='FlowLogsBucketName'].OutputValue" --output text 2>/dev/null)
-      if [ -n "$BUCKET_NAME" ] && [ "$BUCKET_NAME" != "None" ]; then
+      if [ -n "$BUCKET_NAME" ] && [ "$BUCKET_NAME" != "None" ] && [ "$BUCKET_NAME" != "null" ]; then
         print_info "Emptying S3 bucket: $BUCKET_NAME"
-        aws s3 rm "s3://${BUCKET_NAME}" --recursive --region "$REGION" 2>/dev/null || true
+        aws s3 rb "s3://${BUCKET_NAME}" --force --region "$REGION" 2>/dev/null || true
       fi
       print_info "Deleting stack: $stack"
       aws cloudformation delete-stack --stack-name "$stack" --region "$REGION"

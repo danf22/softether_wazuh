@@ -218,6 +218,10 @@ Resources:
                 Resource:
                   - !GetAtt FlowLogsBucket.Arn
                   - !Sub '${FlowLogsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeFlowLogs
+                Resource: '*'
       Path: /
   SoftetherInstanceProfile:
     Type: AWS::IAM::InstanceProfile

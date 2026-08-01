@@ -1,6 +1,6 @@
 # Deploy SoftEther VPN + Wazuh on AWS with CloudFormation
 
-This project deploys SoftEther VPN with Wazuh SIEM on Amazon Web Services using CloudFormation. It provides automated VPN provisioning with persistent configuration, malicious IP detection via AlienVault reputation lists, automatic IP blocking via active response, and a pre-built monitoring dashboard — all through Infrastructure as Code.
+This project deploys SoftEther VPN with Wazuh SIEM on Amazon Web Services using CloudFormation. It provides automated VPN provisioning with persistent configuration, malicious IP detection and blocking via AlienVault reputation lists, VPC Flow Logs monitoring, real-time traffic anomaly detection, and pre-built dashboards — all through Infrastructure as Code.
 
 ## Templates
 
@@ -8,7 +8,6 @@ This project deploys SoftEther VPN with Wazuh SIEM on Amazon Web Services using 
 |---|---|
 | `vpc.yml` | VPC with 2 public and 2 private subnets, NAT Gateway, and routing |
 | `Softether_wazuh.yml` | SoftEther + Wazuh (unified template with internal/external mode) |
-| `Sofether_internal_no_wazuh.yml` | SoftEther only (no Wazuh) with a public Elastic IP |
 
 ## Architecture
 
@@ -17,18 +16,22 @@ The unified `Softether_wazuh.yml` template supports two deployment modes:
 - **Internal mode**: SoftEther gets a public Elastic IP (direct internet access)
 - **External mode**: SoftEther sits behind a Network Load Balancer with TLS termination
 
-Both modes share these characteristics:
+Both modes include:
 
 - **Amazon Linux 2** AMI (auto-resolved via SSM parameter)
 - **Nitro instance support** (t3a.medium default)
-- **systemd service** for vpnserver with automatic config backup on start/stop
+- **systemd service** for vpnserver with automatic config backup
 - **Persistent VPN configuration** on a dedicated encrypted EBS volume (`DeletionPolicy: Retain`)
-- **Default VPN user** created during first deployment via parameters
+- **Persistent Wazuh configuration** on a separate encrypted EBS volume (`DeletionPolicy: Retain`)
+- **Default VPN user** created during first deployment
 - **IP forwarding** persisted via `/etc/sysctl.d/99-ip-forward.conf`
 - **cfn-signal** for reliable CloudFormation creation feedback
 - **Wazuh agent** on SoftEther instance forwarding VPN security logs
-- **Automatic dashboard import** — visualizations imported into Wazuh during deployment
+- **VPC Flow Logs** captured to S3 and ingested by Wazuh
 - **Active response** — automatic IP blocking for AlienVault-flagged IPs
+- **Daily AlienVault threat intel updates** via cron
+- **Real-time traffic monitoring** — per-session bandwidth and packet analysis every 5 minutes
+- **Pre-built dashboards** auto-imported during deployment
 
 ### Security Monitoring Stack
 
@@ -36,28 +39,67 @@ Both modes share these characteristics:
 |---|---|
 | **SoftEther VPN** | VPN server with L2TP/IPsec |
 | **Wazuh Manager** | SIEM: log collection, rule correlation, alerting, active response |
-| **Wazuh Agent** | Forwards SoftEther security logs to the manager |
-| **AlienVault OTX** | Threat intelligence IP reputation database |
+| **Wazuh Agent** | Forwards SoftEther security and traffic logs to the manager |
+| **AlienVault OTX** | Threat intelligence IP reputation database (auto-updated daily) |
+| **VPC Flow Logs** | Network traffic metadata (accept/reject) for all VPC traffic |
+| **Traffic Monitor** | Cron-based per-session bandwidth/packet analysis with anomaly alerts |
 
 ### Wazuh Features
 
-- AlienVault IP reputation database integration
+- AlienVault IP reputation database integration (daily auto-update)
 - Custom decoders for SoftEther VPN log parsing
 - Custom rules for authentication events, brute-force detection, and malicious IP alerts
-- **Active response**: automatically blocks IPs found in AlienVault reputation list via `firewall-drop` (iptables)
-- Pre-configured dashboard:
+- **Active response**: automatically blocks IPs found in AlienVault via `firewall-drop` (iptables)
+- **VPC Flow Logs**: ingested via S3 with accept/reject traffic analysis
+- **Traffic monitoring**: per-session bandwidth tracking with high-traffic and unusual packet ratio alerts
+- Pre-configured dashboards:
   - **SoftEther VPN Dashboard** — OS, Country, City, VPN Map, AlienVault IPs, user auth table
+  - **VPC Flow Logs Dashboard** — Accepted vs Rejected, top rejected IPs, targeted ports, timeline
+
+### Traffic Monitoring
+
+A cron job runs every 5 minutes on the SoftEther instance to collect per-session traffic metrics:
+
+- **Bytes transferred** (TX/RX totals and deltas since last check)
+- **Packet counts** (unicast TX/RX)
+- **Connection duration** (connected-since timestamp)
+
+Alerts are generated for:
+
+| Alert | Threshold | Description |
+|---|---|---|
+| HIGH_TRAFFIC | >100 MB in 5 min | Single session transferred over 100 MB delta |
+| UNUSUAL_PACKET_RATIO | TX/RX ratio > 50:1 | Possible port scanning or DDoS behavior |
+
+Wazuh rules escalate repeated anomalies:
+
+| Rule ID | Level | Description |
+|---|---|---|
+| 100900 | 0 | Traffic monitoring event (no alert) |
+| 100901 | 10 | High traffic detected (>100 MB in 5 min) |
+| 100902 | 12 | Unusual packet ratio (possible scanning/DDoS) |
+| 100903 | 13 | Sustained high traffic (3 alerts in 30 min — possible exfiltration) |
+| 100904 | 14 | Repeated unusual pattern (3 alerts in 15 min — active attack) |
 
 ### Active Response
 
-When a VPN connection attempt comes from an IP found in the AlienVault reputation database, the system automatically:
+When a VPN connection attempt comes from an IP found in the AlienVault reputation database:
 
 1. Wazuh Manager triggers rule `100100` or `100305`
 2. Active response executes `firewall-drop` on the SoftEther agent
 3. An iptables DROP rule is added for the offending IP
 4. The IP is automatically unblocked after 1 hour (configurable)
 
-This is enabled by default during deployment — no manual configuration needed.
+Enabled by default — no manual configuration needed.
+
+### VPC Flow Logs
+
+All VPC network traffic is captured and analyzed:
+
+1. AWS VPC Flow Logs deliver to an S3 bucket (60-second aggregation)
+2. Wazuh's `aws-s3` module polls the bucket every 5 minutes
+3. Flow events are indexed and available in the VPC Flow Logs Dashboard
+4. Bucket has a 30-day lifecycle policy for automatic cleanup
 
 ## Parameters
 
@@ -109,91 +151,84 @@ The CloudFormation templates create the following AWS resources:
 - VPC with public/private subnets and NAT Gateway (`vpc.yml`)
 - EC2 instances (SoftEther and Wazuh)
 - Security Groups (VPN ports 443/TCP, 500/UDP, 4500/UDP, 1701/UDP)
-- IAM Roles with SSM access for management
+- IAM Roles with SSM + S3 + EC2 DescribeFlowLogs access
 - Network Interfaces
-- Dedicated encrypted EBS volumes for config persistence
+- Dedicated encrypted EBS volumes for config persistence (SoftEther 5 GB, Wazuh 10 GB)
+- S3 bucket for VPC Flow Logs (30-day retention)
+- VPC Flow Log (all traffic, 60-second intervals)
 - Elastic IP (internal mode) or Network Load Balancer with ACM certificate (external mode)
 - Route 53 DNS record (external mode)
+- ACM certificate with DNS validation (external mode)
 
 ## Deployment
 
-### Step 1: Deploy the VPC
+### Prerequisites
 
-Deploy `vpc.yml`. It creates a VPC with 2 public subnets, 2 private subnets, a NAT Gateway, and routing tables.
+- AWS CLI installed and configured
+- Valid AWS credentials with permissions for CloudFormation, EC2, IAM, S3, ELB, ACM, and Route 53
+- A Route 53 hosted zone (external mode only)
 
-**Important:** All subnets used for SoftEther and Wazuh must be in the **same AZ** as the `AvailabilityZone` parameter you choose.
-
-### Step 2: Deploy SoftEther + Wazuh
-
-#### Option A: Internal Mode (Elastic IP)
-
-Best for: direct internet access without a load balancer.
+### Step 1: Run the deployment script
 
 ```bash
+chmod +x deploy.sh
 ./deploy.sh
-# Select option 1
 ```
 
-Provide: VPC ID, public subnet (SoftEther), private subnet (Wazuh), AZ, passwords, hub name, PSK, and default VPN user credentials.
+The script presents an interactive menu:
 
-Outputs: Wazuh URL, SoftEther Elastic IP.
+```
+╔═══════════════════════════════════════════════════════════╗
+║       SoftEther VPN + Wazuh — AWS Deployment Tool        ║
+╚═══════════════════════════════════════════════════════════╝
 
-![SoftEther + Wazuh architecture](Softether+Wazuh.png)
+  Deployment options:
 
-#### Option B: External Mode (NLB + TLS)
+    1) Internal — SoftEther + Wazuh (Elastic IP, direct access)
+    2) Internal — SoftEther Only (Elastic IP, no monitoring)
+    3) External — SoftEther + Wazuh (NLB + TLS + Route 53)
 
-Best for: production deployments with TLS termination and a custom domain.
+  Management:
 
-**Requires:** A Route 53 hosted zone with your domain. The stack automatically creates the ACM certificate (with DNS validation) and the DNS A-record alias pointing to the NLB.
-
-```bash
-./deploy.sh
-# Select option 3
+    4) Destroy all stacks
+    5) Exit
 ```
 
-Provide: VPC ID, private subnets (SoftEther + Wazuh), two public subnets (NLB), AZ, domain name, Route 53 hosted zone ID, passwords, hub name, PSK, and default VPN user credentials.
+### Step 2: Choose VPC
 
-Outputs: Wazuh URL, NLB DNS name, VPN domain name.
+The script asks whether to create a new VPC or use an existing one:
+- **New VPC**: deploys `vpc.yml` automatically
+- **Existing VPC**: prompts for VPC ID and subnet IDs
 
-![SoftEther + Wazuh + NLB architecture](Softether+Wazuh+NLB.png)
+### Step 3: Configure parameters
 
-#### Option C: SoftEther Only (No Wazuh)
+The script prompts for all required values: region, AZ, hub name, passwords, instance type, and Wazuh version.
 
-Best for: VPN-only deployments without monitoring.
+Password requirements: 8–64 characters with at least one uppercase, one lowercase, one number, and one special character (`. * + ? -`).
 
-```bash
-./deploy.sh
-# Select option 2
-```
+### Step 4: Connect to SoftEther VPN
 
-Uses `Sofether_internal_no_wazuh.yml`. Outputs: SoftEther Elastic IP.
-
-### Step 3: Connect to SoftEther VPN
-
-Use the **SoftEther VPN Client** or any L2TP/IPsec client. Connect using:
-- Server: Elastic IP (internal mode) or domain name (external mode)
+Use the **SoftEther VPN Client** or any L2TP/IPsec client:
+- Server: Elastic IP (internal) or domain name (external)
 - Hub: the hub name you specified
-- User: the default VPN user credentials from the stack parameters
+- User/Password: default VPN credentials from parameters
 - IPsec PSK: the pre-shared key you specified
 
-You can also use the **SoftEther VPN Server Manager** to manage hubs, users, and settings.
+### Step 5: Access Wazuh
 
-### Step 4: Access Wazuh
+Connect to the VPN, then access the Wazuh dashboard at the private IP shown in stack Outputs. Login: `admin` / your Wazuh password.
 
-Once connected to the VPN, access the Wazuh interface at the URL shown in the stack Outputs. Log in with user `admin` and the Wazuh password from stack parameters.
+Two dashboards are available:
+- **SoftEther VPN Dashboard** — VPN connection monitoring
+- **VPC Flow Logs Dashboard** — network traffic analysis
 
-The **SoftEther VPN Dashboard** is automatically imported and available under **Dashboards** in the Wazuh UI.
+### Destroy stacks
 
-## Active Response Details
+Option 4 in the deploy script removes all stacks. The S3 bucket is emptied automatically before deletion. EBS config volumes are retained (DeletionPolicy: Retain) so VPN and Wazuh configurations survive stack recreation.
 
-Active response is configured automatically during deployment. When an IP from the AlienVault reputation database attempts to connect to the VPN:
+## Active Response Configuration
 
-- **Rules triggered**: `100100` (AlienVault IP in web/attack events) and `100305` (AlienVault IP attempting VPN login)
-- **Action**: `firewall-drop` — adds an iptables INPUT/DROP rule on the SoftEther instance
-- **Location**: `local` — executes on the agent where the event was detected
-- **Timeout**: 3600 seconds (1 hour) — IP is automatically unblocked after timeout
-
-To customize the timeout or add more rules, edit `/var/ossec/etc/ossec.conf` on the Wazuh manager:
+Active response is configured automatically. To customize:
 
 ```xml
 <active-response>
@@ -205,61 +240,77 @@ To customize the timeout or add more rules, edit `/var/ossec/etc/ossec.conf` on 
 </active-response>
 ```
 
-Set `<timeout>0</timeout>` for permanent blocks. Restart after changes: `sudo systemctl restart wazuh-manager`.
+- Set `<timeout>0</timeout>` for permanent blocks
+- Add more rule IDs to expand blocking triggers
+- Edit on Wazuh manager at `/var/ossec/etc/ossec.conf`, then restart: `sudo systemctl restart wazuh-manager`
 
-## EBS Config Volume
+## EBS Config Volumes
 
-The dedicated EBS volume ensures VPN configuration survives instance replacement:
+Dedicated EBS volumes ensure configuration survives instance replacement:
 
-1. **First boot:** volume is formatted, VPN is configured from parameters, default user is created, config is backed up.
-2. **Systemd service:** syncs config to EBS on every start/stop.
-3. **Subsequent boots:** existing config is detected and restored — VPN setup commands are skipped entirely.
+### SoftEther (5 GB, `/dev/xvdf`)
 
-The volume uses `DeletionPolicy: Retain` so it survives stack deletes.
+1. **First boot**: volume is formatted, VPN configured, default user created, config backed up
+2. **Subsequent boots**: existing config detected and restored automatically
+3. **DeletionPolicy: Retain**: volume survives stack deletes
 
-## Visualizations and Dashboard
+### Wazuh (10 GB, `/dev/xvdg`)
 
-The `Visualizations.ndjson` file contains pre-configured Wazuh saved objects:
+1. **First boot**: Wazuh installed, rules/decoders/lists configured, everything backed up
+2. **Subsequent boots**: config, rules, decoders, and lists restored from volume
+3. **DeletionPolicy: Retain**: volume survives stack deletes
+
+## Dashboards
 
 ### SoftEther VPN Dashboard
 
-| Object | Type | Description |
+| Visualization | Type | Description |
 |---|---|---|
 | OS System | Pie chart | Operating systems connecting to the VPN |
 | Country | Pie chart | Countries of connecting clients |
 | City | Pie chart | Cities of connecting clients |
-| VPN Map | Tile map | Geographic map of VPN connection attempts |
-| Table of IPs found in AlienVault | Table | IPs flagged in the AlienVault reputation database |
-| User authentication successful table | Table | Successful VPN logins with IP, user, country, city, and time |
+| VPN Map | Tile map | Geographic map of connection attempts |
+| AlienVault IPs | Table | IPs flagged in reputation database |
+| User Auth Table | Table | Successful logins with IP, user, country, city, time |
 
-These are automatically imported during deployment. To manually re-import: **Dashboards Management → Saved Objects → Import** and select `Visualizations.ndjson`.
+### VPC Flow Logs Dashboard
+
+| Visualization | Type | Description |
+|---|---|---|
+| Accepted vs Rejected | Pie chart | Ratio of allowed vs blocked traffic |
+| Top Rejected Source IPs | Bar chart | IPs generating the most rejected connections |
+| Top Targeted Ports | Pie chart | Most targeted ports by blocked traffic |
+| Events Over Time | Histogram | Timeline of flow events by action |
+| Rejected Connections Detail | Table | Source IP, dest IP, port, protocol |
+
+Dashboards are auto-imported during deployment. To manually re-import: **Dashboards Management → Saved Objects → Import** → select `Visualizations.ndjson`.
 
 ## Custom Wazuh Rules
 
 | Rule ID | Level | Description |
 |---|---|---|
-| 100100 | 10 | IP found in AlienVault reputation database (triggers active response) |
-| 100302 | 0 | SoftEther authentication events (base rule, no alert) |
-| 100303 | 3 | Remote connection attempt to VPN |
-| 100304 | 5 | VPN user authentication failed |
-| 100305 | 10 | AlienVault IP attempting VPN login (triggers active response) |
-| 100306 | 10 | 10+ failed login attempts in 2 minutes (brute-force) |
+| 100100 | 10 | IP found in AlienVault database (triggers block) |
+| 100303 | 3 | Remote VPN connection attempt |
+| 100304 | 5 | VPN authentication failed |
+| 100305 | 10 | AlienVault IP attempting VPN login (triggers block) |
+| 100306 | 10 | 10+ failed logins in 2 minutes (brute-force) |
 | 100307 | 10 | 10+ connection attempts from same IP in 2 minutes |
-| 100402 | 0 | SoftEther access events (base rule, no alert) |
-| 100404 | 3 | Successful VPN user authentication |
-| 100802 | 0 | SoftEther client details (base rule, no alert) |
-| 100804 | 3 | Client details: OS, hostname |
+| 100404 | 3 | Successful VPN authentication |
+| 100804 | 3 | VPN client details (OS, hostname) |
+| 100901 | 10 | High traffic alert (>100 MB in 5 min) |
+| 100902 | 12 | Unusual packet ratio (possible scanning/DDoS) |
+| 100903 | 13 | Sustained high traffic (possible data exfiltration) |
+| 100904 | 14 | Repeated unusual traffic pattern (active attack) |
 
 ## Files
 
 ```
-├── vpc.yml                         # VPC infrastructure
-├── Softether_wazuh.yml             # SoftEther + Wazuh (unified, internal/external)
-├── Sofether_internal_no_wazuh.yml  # SoftEther only + Elastic IP
-├── deploy.sh                       # Interactive deployment script
-├── Visualizations.ndjson           # Wazuh dashboard and visualizations
-├── Softether+Wazuh.png             # Architecture diagram (internal)
-├── Softether+Wazuh+NLB.png         # Architecture diagram (external/NLB)
+├── vpc.yml                    # VPC infrastructure (2 public + 2 private subnets, NAT)
+├── Softether_wazuh.yml        # SoftEther + Wazuh (unified, internal/external mode)
+├── deploy.sh                  # Interactive deployment script
+├── Visualizations.ndjson      # Wazuh dashboards and visualizations
+├── Softether+Wazuh.png        # Architecture diagram (internal mode)
+├── Softether+Wazuh+NLB.png   # Architecture diagram (external/NLB mode)
 └── README.md
 ```
 
@@ -267,5 +318,7 @@ These are automatically imported during deployment. To manually re-import: **Das
 
 | Version | Changes |
 |---|---|
-| v2.0 | Merged internal/external templates into unified `Softether_wazuh.yml`. Added deployment mode parameter. Route 53 + ACM automation for external mode. Parameterized SoftEther and Wazuh versions. Active response for automatic IP blocking. Organized parameters with CloudFormation Interface metadata. |
-| v1.0 | Initial release with separate internal/external templates. SoftEther + Wazuh with AlienVault threat intel. |
+| v3.0 | Added real-time traffic monitoring (per-session bandwidth/packet analysis). New Wazuh rules 100900–100904 for traffic anomaly detection. Wazuh persistent EBS volume with auto-restore. Dashboard auto-import during deployment. Removed standalone SoftEther-only template in favor of unified template. |
+| v2.1 | Added VPC Flow Logs (S3 → Wazuh) with dashboard. Daily AlienVault auto-update cron. Deploy script VPC selection (new or existing). |
+| v2.0 | Merged internal/external templates. Route 53 + ACM automation. Parameterized versions. Active response. CloudFormation Interface metadata. |
+| v1.0 | Initial release with separate templates. SoftEther + Wazuh with AlienVault threat intel. |
