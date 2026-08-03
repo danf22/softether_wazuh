@@ -112,7 +112,8 @@ Parameters are organized into groups in the CloudFormation console:
 | `DeploymentMode` | `internal` (EIP) or `external` (NLB + TLS) | `internal` |
 | `EC2InstanceType` | Instance type for SoftEther and Wazuh | `t3a.medium` |
 | `LatestAmiId` | SSM path for Amazon Linux 2 AMI | `/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs` |
-| `AvailabilityZone` | AZ for deployment (must match subnets) | — |
+| `SoftetherAvailabilityZone` | AZ for SoftEther instance and volume (auto-detected from subnet) | — |
+| `WazuhAvailabilityZone` | AZ for Wazuh instance and volume (auto-detected from subnet) | — |
 
 ### Network Configuration
 
@@ -121,6 +122,7 @@ Parameters are organized into groups in the CloudFormation console:
 | `VPCId` | VPC ID for deployment | — |
 | `SubnetIdSoftether` | Public subnet (internal) or private subnet (external) for SoftEther | — |
 | `SubnetIdPrivateWazuh` | Private subnet for Wazuh | — |
+| `PrivateNetworkCIDR` | Private network CIDR to push as VPN route to clients | `10.0.3.0/24` |
 | `SubnetIdPublicOne` | First public subnet for NLB (external only) | `''` |
 | `SubnetIdPublicTwo` | Second public subnet for NLB (external only) | `''` |
 | `DomainName` | VPN domain name, e.g. vpn.example.com (external only) | `''` |
@@ -135,7 +137,7 @@ Parameters are organized into groups in the CloudFormation console:
 | `IPsecPreSharedKey` | IPsec L2TP pre-shared key | — |
 | `DefaultVPNUser` | Default VPN username | — |
 | `DefaultVPNUserPassword` | Password for the default VPN user | — |
-| `SoftetherDownloadUrl` | Full URL for SoftEther tarball | v4.44-9807-rtm |
+| `SoftetherDownloadUrl` | SoftEther version (selected from available RTM releases) | v4.44-9807-rtm |
 
 ### Wazuh Configuration
 
@@ -165,6 +167,7 @@ The CloudFormation templates create the following AWS resources:
 ### Prerequisites
 
 - AWS CLI installed and configured
+- Python 3 (used for JSON escaping and CIDR conversion)
 - Valid AWS credentials with permissions for CloudFormation, EC2, IAM, S3, ELB, ACM, and Route 53
 - A Route 53 hosted zone (external mode only)
 
@@ -185,28 +188,45 @@ The script presents an interactive menu:
   Deployment options:
 
     1) Internal — SoftEther + Wazuh (Elastic IP, direct access)
-    2) Internal — SoftEther Only (Elastic IP, no monitoring)
-    3) External — SoftEther + Wazuh (NLB + TLS + Route 53)
+    2) External — SoftEther + Wazuh (NLB + TLS + Route 53)
 
   Management:
 
-    4) Destroy all stacks
-    5) Exit
+    3) Destroy all stacks
+    4) Exit
 ```
 
 ### Step 2: Choose VPC
 
 The script asks whether to create a new VPC or use an existing one:
 - **New VPC**: deploys `vpc.yml` automatically
-- **Existing VPC**: prompts for VPC ID and subnet IDs
+- **Existing VPC**: prompts for VPC ID, subnet IDs, and private network CIDR
 
 ### Step 3: Configure parameters
 
-The script prompts for all required values: region, AZ, hub name, passwords, instance type, and Wazuh version.
+The script prompts for all required values: hub name, passwords, instance type, SoftEther version, and Wazuh version.
 
-Password requirements: 8–64 characters with at least one uppercase, one lowercase, one number, and one special character (`. * + ? -`).
+The deploy script includes smart validations:
 
-### Step 4: Connect to SoftEther VPN
+- **AZ auto-detection**: Availability Zones are automatically detected from the selected subnets — no manual AZ input needed
+- **Instance type validation**: Checks that the chosen instance type is available in the subnet AZs before deploying
+- **Interactive recovery**: If the instance type isn't available, shows which AZs support it and offers options to either change the instance type or change subnets
+- **Password validation**: Enforces CloudFormation password requirements (8–64 chars, uppercase, lowercase, number, and one of `. * + ? -`)
+- **Parameters as JSON**: All parameters are passed via a temporary JSON file to safely handle special characters in passwords
+
+### Step 4: Choose versions
+
+The script offers interactive version selection for both components:
+
+**SoftEther versions (RTM only):**
+- v4.44-9807-rtm (latest, 2025.04.16)
+- v4.42-9798-rtm (2023.06.30)
+- v4.41-9787-rtm (2023.03.14)
+- v4.38-9760-rtm (2021.08.17)
+
+**Wazuh versions:** 4.14, 4.13, 4.12, 4.11, 4.10, 4.9
+
+### Step 5: Connect to SoftEther VPN
 
 Use the **SoftEther VPN Client** or any L2TP/IPsec client:
 - Server: Elastic IP (internal) or domain name (external)
@@ -214,7 +234,7 @@ Use the **SoftEther VPN Client** or any L2TP/IPsec client:
 - User/Password: default VPN credentials from parameters
 - IPsec PSK: the pre-shared key you specified
 
-### Step 5: Access Wazuh
+### Step 6: Access Wazuh
 
 Connect to the VPN, then access the Wazuh dashboard at the private IP shown in stack Outputs. Login: `admin` / your Wazuh password.
 
@@ -224,7 +244,7 @@ Two dashboards are available:
 
 ### Destroy stacks
 
-Option 4 in the deploy script removes all stacks. The S3 bucket is emptied automatically before deletion. EBS config volumes are retained (DeletionPolicy: Retain) so VPN and Wazuh configurations survive stack recreation.
+Option 3 in the deploy script removes all stacks. The S3 bucket is force-deleted (all objects removed) automatically before stack deletion. EBS config volumes are retained (`DeletionPolicy: Retain`) so VPN and Wazuh configurations survive stack recreation.
 
 ## Active Response Configuration
 
@@ -307,7 +327,7 @@ Dashboards are auto-imported during deployment. To manually re-import: **Dashboa
 ```
 ├── vpc.yml                    # VPC infrastructure (2 public + 2 private subnets, NAT)
 ├── Softether_wazuh.yml        # SoftEther + Wazuh (unified, internal/external mode)
-├── deploy.sh                  # Interactive deployment script
+├── deploy.sh                  # Interactive deployment script with validations
 ├── Visualizations.ndjson      # Wazuh dashboards and visualizations
 ├── Softether+Wazuh.png        # Architecture diagram (internal mode)
 ├── Softether+Wazuh+NLB.png   # Architecture diagram (external/NLB mode)
@@ -318,6 +338,7 @@ Dashboards are auto-imported during deployment. To manually re-import: **Dashboa
 
 | Version | Changes |
 |---|---|
+| v3.1 | Separate AZ per instance (SoftEther/Wazuh can be in different AZs). Auto-detect AZs from subnets. Instance type AZ validation with interactive recovery. SoftEther version selector (4 RTM releases). Dynamic PUSHROUTE from `PrivateNetworkCIDR` parameter. Parameters passed via JSON file for safe special character handling. S3 bucket force-deleted on destroy. |
 | v3.0 | Added real-time traffic monitoring (per-session bandwidth/packet analysis). New Wazuh rules 100900–100904 for traffic anomaly detection. Wazuh persistent EBS volume with auto-restore. Dashboard auto-import during deployment. Removed standalone SoftEther-only template in favor of unified template. |
 | v2.1 | Added VPC Flow Logs (S3 → Wazuh) with dashboard. Daily AlienVault auto-update cron. Deploy script VPC selection (new or existing). |
 | v2.0 | Merged internal/external templates. Route 53 + ACM automation. Parameterized versions. Active response. CloudFormation Interface metadata. |

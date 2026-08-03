@@ -113,6 +113,21 @@ prompt_password() {
   printf -v "$var_name" '%s' "$value"
 }
 
+# Validate instance type is available in the given AZ
+validate_instance_type_az() {
+  local instance_type="$1"
+  local az="$2"
+  local available
+  available=$(aws ec2 describe-instance-type-offerings \
+    --location-type availability-zone \
+    --filters "Name=instance-type,Values=$instance_type" "Name=location,Values=$az" \
+    --region "$REGION" --query "InstanceTypeOfferings[0].InstanceType" --output text 2>/dev/null)
+  if [ "$available" = "None" ] || [ -z "$available" ]; then
+    return 1
+  fi
+  return 0
+}
+
 # Prompt for Wazuh version from allowed list
 prompt_wazuh_version() {
   echo ""
@@ -264,7 +279,48 @@ deploy_internal() {
   prompt IPSEC_PSK "IPsec pre-shared key" "" true
   prompt DEFAULT_VPN_USER "Default VPN username"
   prompt_password DEFAULT_VPN_USER_PASSWORD "Default VPN user password"
-  prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
+
+  # Prompt for instance type with AZ availability validation (retry loop)
+  while true; do
+    prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
+    local az_fail=""
+    for check_az in "$SOFTETHER_AZ" "$WAZUH_AZ"; do
+      if ! validate_instance_type_az "$INSTANCE_TYPE" "$check_az"; then
+        az_fail="$check_az"
+        break
+      fi
+    done
+    if [ -n "$az_fail" ]; then
+      print_error "Instance type '$INSTANCE_TYPE' is not available in $az_fail."
+      print_info "AZs where '$INSTANCE_TYPE' is available:"
+      aws ec2 describe-instance-type-offerings \
+        --location-type availability-zone \
+        --filters "Name=instance-type,Values=$INSTANCE_TYPE" \
+        --region "$REGION" --query "InstanceTypeOfferings[].Location" \
+        --output text 2>/dev/null | tr '\t' '\n' | sort
+      echo ""
+      echo "  Options:"
+      echo "    1) Enter a different instance type"
+      echo "    2) Change subnets (re-enter subnet IDs)"
+      echo ""
+      read -p "  Select [1]: " fix_choice
+      fix_choice="${fix_choice:-1}"
+      if [ "$fix_choice" = "2" ]; then
+        prompt PUBLIC_SUBNET_1 "Public Subnet 1 ID (for SoftEther)"
+        prompt PRIVATE_SUBNET_1 "Private Subnet 1 ID (for Wazuh)"
+        SOFTETHER_AZ=$(aws ec2 describe-subnets --subnet-ids "$PUBLIC_SUBNET_1" --region "$REGION" \
+          --query "Subnets[0].AvailabilityZone" --output text)
+        WAZUH_AZ=$(aws ec2 describe-subnets --subnet-ids "$PRIVATE_SUBNET_1" --region "$REGION" \
+          --query "Subnets[0].AvailabilityZone" --output text)
+        print_info "New SoftEther AZ: $SOFTETHER_AZ"
+        print_info "New Wazuh AZ: $WAZUH_AZ"
+      fi
+      # Loop back to re-prompt instance type
+    else
+      break
+    fi
+  done
+
   prompt_softether_version
   prompt_wazuh_version
 
@@ -324,7 +380,37 @@ deploy_external() {
   prompt_password DEFAULT_VPN_USER_PASSWORD "Default VPN user password"
   prompt DOMAIN_NAME "VPN domain name (e.g. vpn.example.com)"
   prompt HOSTED_ZONE_ID "Route 53 Hosted Zone ID"
-  prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
+
+  # Prompt for instance type with AZ availability validation (retry loop)
+  while true; do
+    prompt INSTANCE_TYPE "EC2 instance type" "t3a.medium"
+    if ! validate_instance_type_az "$INSTANCE_TYPE" "$SOFTETHER_AZ"; then
+      print_error "Instance type '$INSTANCE_TYPE' is not available in $SOFTETHER_AZ."
+      print_info "AZs where '$INSTANCE_TYPE' is available:"
+      aws ec2 describe-instance-type-offerings \
+        --location-type availability-zone \
+        --filters "Name=instance-type,Values=$INSTANCE_TYPE" \
+        --region "$REGION" --query "InstanceTypeOfferings[].Location" \
+        --output text 2>/dev/null | tr '\t' '\n' | sort
+      echo ""
+      echo "  Options:"
+      echo "    1) Enter a different instance type"
+      echo "    2) Change private subnet (re-enter subnet ID)"
+      echo ""
+      read -p "  Select [1]: " fix_choice
+      fix_choice="${fix_choice:-1}"
+      if [ "$fix_choice" = "2" ]; then
+        prompt PRIVATE_SUBNET_1 "Private Subnet 1 ID (for SoftEther and Wazuh)"
+        SOFTETHER_AZ=$(aws ec2 describe-subnets --subnet-ids "$PRIVATE_SUBNET_1" --region "$REGION" \
+          --query "Subnets[0].AvailabilityZone" --output text)
+        WAZUH_AZ="$SOFTETHER_AZ"
+        print_info "New AZ: $SOFTETHER_AZ"
+      fi
+    else
+      break
+    fi
+  done
+
   prompt_softether_version
   prompt_wazuh_version
 
