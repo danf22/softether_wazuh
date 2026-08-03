@@ -2,6 +2,7 @@
 
 This project deploys SoftEther VPN with Wazuh SIEM on Amazon Web Services using CloudFormation. It provides automated VPN provisioning with persistent configuration, malicious IP detection and blocking via AlienVault reputation lists, VPC Flow Logs monitoring, real-time traffic anomaly detection, and pre-built dashboards — all through Infrastructure as Code.
 
+![Description of the image](Softether+Wazuh+NLB.png)
 ## Templates
 
 | Template | Description |
@@ -14,7 +15,9 @@ This project deploys SoftEther VPN with Wazuh SIEM on Amazon Web Services using 
 The unified `Softether_wazuh.yml` template supports two deployment modes:
 
 - **Internal mode**: SoftEther gets a public Elastic IP (direct internet access)
+  ![Description of the image](Softether+Wazuh.png)
 - **External mode**: SoftEther sits behind a Network Load Balancer with TLS termination
+  ![Description of the image](Softether+Wazuh+NLB.png)
 
 Both modes include:
 
